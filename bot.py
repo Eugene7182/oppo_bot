@@ -246,7 +246,8 @@ async def main():
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.start()
 
-    # Устанавливаем webhook
+    # --- Сброс старого вебхука и установка нового ---
+    await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
 
     # aiohttp web server
