@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 conn = sqlite3.connect("sales.db")
 cursor = conn.cursor()
@@ -56,7 +56,7 @@ def add_sale(username, model, memory, qty, network="-"):
 def get_sales_month():
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
     cursor.execute("""
-        SELECT username, SUM(qty), 
+        SELECT username, SUM(qty),
         (SELECT plan FROM plans WHERE plans.username = sales.username),
         COALESCE(network, '-')
         FROM sales
@@ -99,12 +99,12 @@ def set_plan(username, plan):
 
 # --- Стоки ---
 def update_stock(username, item, qty, network="-"):
-    cursor.execute("SELECT qty FROM stok WHERE username=? AND item=?", (username, item))
+    cursor.execute("SELECT qty FROM stok WHERE username=? AND item=? AND network=?", (username, item, network))
     row = cursor.fetchone()
     if row:
         cursor.execute(
-            "UPDATE stok SET qty=?, network=?, last_update=? WHERE username=? AND item=?",
-            (qty, network, datetime.now().strftime("%Y-%m-%d %H:%M"), username, item)
+            "UPDATE stok SET qty=?, last_update=? WHERE username=? AND item=? AND network=?",
+            (qty, datetime.now().strftime("%Y-%m-%d %H:%M"), username, item, network)
         )
     else:
         cursor.execute(
@@ -124,6 +124,22 @@ def get_stocks(username=None, network=None):
         params.append(network)
     cursor.execute(query, tuple(params))
     return cursor.fetchall()
+
+def get_stock_qty(username, item, network="-"):
+    cursor.execute("SELECT qty FROM stok WHERE username=? AND item=? AND network=?", (username, item, network))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+def decrease_stock(username, item, qty, network="-"):
+    cursor.execute("SELECT qty FROM stok WHERE username=? AND item=? AND network=?", (username, item, network))
+    row = cursor.fetchone()
+    if row:
+        new_qty = max(0, row[0] - qty)
+        cursor.execute(
+            "UPDATE stok SET qty=?, last_update=? WHERE username=? AND item=? AND network=?",
+            (new_qty, datetime.now().strftime("%Y-%m-%d %H:%M"), username, item, network)
+        )
+        conn.commit()
 
 # --- Админы ---
 def add_admin(username):
