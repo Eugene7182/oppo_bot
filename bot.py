@@ -1,7 +1,8 @@
 import asyncio
 import calendar
-import re
+import logging
 import os
+import re
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pytz import timezone
@@ -14,27 +15,29 @@ from aiogram.enums import ParseMode
 
 import db
 
-# --- Настройки ---
-TOKEN = os.getenv("BOT_TOKEN", "ТОКЕН_ТУТ")   # обязательно переменная BOT_TOKEN
+# --------------------------
+# НАСТРОЙКИ
+# --------------------------
+TOKEN = os.getenv("BOT_TOKEN", "")
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1002663663535"))
 ADMINS_ENV = os.getenv("ADMINS", "").split(",") if os.getenv("ADMINS") else []
 tz = timezone("Asia/Almaty")
+
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://oppo-bot-k2d2.onrender.com")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# --- Сети ---
-NETWORKS = ["mechta", "beeline", "sulpak", "sulpka", "td"]
+logging.basicConfig(level=logging.INFO)
 
-# --- Хелперы ---
-def is_admin(username: str) -> bool:
-    if not username:
-        return False
-    if username in ADMINS_ENV:
-        return True
-    return db.is_admin(username)
+# --------------------------
+# СЕТИ
+# --------------------------
+NETWORKS = ["mechta", "beeline", "sulpak", "sulpka", "td"]
 
 def extract_network(text: str) -> str:
     for net in NETWORKS:
@@ -42,8 +45,20 @@ def extract_network(text: str) -> str:
             return net.capitalize()
     return "-"
 
-# --- Регулярки ---
-SALE_RE = re.compile(r"([a-zа-яё0-9\-\+]+)\s+(\d{2,4}(?:tb|тб)?)\s*(\d+)?", re.IGNORECASE)
+# --------------------------
+# АДМИНЫ
+# --------------------------
+def is_admin(username: str) -> bool:
+    if not username:
+        return False
+    if username in ADMINS_ENV:
+        return True
+    return db.is_admin(username)
+
+# --------------------------
+# РЕГУЛЯРКИ
+# --------------------------
+SALE_RE = re.compile(r"([a-zа-яё0-9\-\+]+)\s+(\d{2,4}(?:tb|тб)?)\s*[-—: ]?\s*(\d+)?", re.IGNORECASE)
 STOCK_RE = re.compile(
     r"([a-zа-яё0-9\+\-\s]+?)\s*(?:\(?\d+\/)?(\d{2,4})(?:тб|tb)?\)?\s*[-—: ]?\s*(\d+)?",
     re.IGNORECASE
@@ -56,10 +71,10 @@ STOCK_RE = re.compile(
 async def sales_handler(message: Message):
     if message.chat.id != GROUP_CHAT_ID or not message.text or message.text.startswith("/"):
         return
-    text = message.text.strip()
-    if "доля" in text.lower():
+    if "доля" in message.text.lower():
         return
 
+    text = message.text.strip()
     network = extract_network(text)
 
     try:
@@ -73,17 +88,17 @@ async def sales_handler(message: Message):
             qty = int(qty_raw) if qty_raw else 1
             item = f"{model} {memory}"
 
-            # 1) Сохраняем продажу
+            # 1) Запись продажи
             db.add_sale(user, model, memory, qty, network)
 
-            # 2) Проверяем остатки
+            # 2) Проверка стока
             stock_qty = db.get_stock_qty(user, item, network)
             if stock_qty is None:
                 await message.reply(f"⚠ Остаток для {item} не найден. @{user}, обновите сток!")
             elif stock_qty < qty:
                 await message.reply(
                     f"⚠ У @{user} не хватает стока для {item} (продажа {qty}, остаток {stock_qty}).\n"
-                    f"👉 Пожалуйста, обновите остатки!"
+                    f"👉 Обновите остатки!"
                 )
             else:
                 db.decrease_stock(user, item, qty, network)
@@ -97,10 +112,9 @@ async def sales_handler(message: Message):
 # --------------------------
 @router.message()
 async def stock_handler(message: Message):
-    if message.chat.id != GROUP_CHAT_ID:
+    if message.chat.id != GROUP_CHAT_ID or not message.text:
         return
     text = message.text.strip()
-
     if not any(w in text.lower() for w in ["сток", "остаток", "stock", "stocks", "приход", "приехал"]):
         return
 
@@ -124,83 +138,61 @@ async def stock_handler(message: Message):
         if updated_items:
             await message.reply("📦 Обновлено:\n" + "\n".join(updated_items) + f"\n(сеть: {network})")
         else:
-            await message.reply("⚠ Не удалось распознать позиции в сообщении.")
+            await message.reply("⚠ Не удалось распознать позиции.")
     except Exception as e:
         await message.reply(f"⚠ Ошибка стока: {e}")
 
 # --------------------------
-# КОМАНДЫ (админские)
+# АДМИН-КОМАНДЫ
 # --------------------------
 @router.message(F.text.startswith("/admins"))
 async def cmd_admins(message: Message):
-    if not is_admin(message.from_user.username):
-        return
+    if not is_admin(message.from_user.username): return
     admins_env = ", ".join(ADMINS_ENV) if ADMINS_ENV else "-"
     admins_db = ", ".join(db.get_admins()) or "-"
-    await message.reply(f"👑 Админы (ENV): {admins_env}\n👤 Админы (DB): {admins_db}")
+    await message.reply(f"👑 ENV: {admins_env}\n👤 DB: {admins_db}")
 
 @router.message(F.text.startswith("/add_admin"))
 async def cmd_add_admin(message: Message):
-    if not is_admin(message.from_user.username):
-        return
+    if not is_admin(message.from_user.username): return
     parts = message.text.split()
-    if len(parts) != 2:
+    if len(parts) != 2: 
         await message.reply("Использование: /add_admin @username")
         return
-    username = parts[1].lstrip("@")
-    db.add_admin(username)
-    await message.reply(f"✅ @{username} добавлен в админы")
+    db.add_admin(parts[1].lstrip("@"))
+    await message.reply(f"✅ {parts[1]} добавлен")
 
 @router.message(F.text.startswith("/del_admin"))
 async def cmd_del_admin(message: Message):
-    if not is_admin(message.from_user.username):
-        return
+    if not is_admin(message.from_user.username): return
     parts = message.text.split()
-    if len(parts) != 2:
+    if len(parts) != 2: 
         await message.reply("Использование: /del_admin @username")
         return
-    username = parts[1].lstrip("@")
-    db.del_admin(username)
-    await message.reply(f"❌ @{username} удалён из админов")
+    db.del_admin(parts[1].lstrip("@"))
+    await message.reply(f"❌ {parts[1]} удалён")
 
 @router.message(F.text.startswith("/plan"))
 async def cmd_plan(message: Message):
-    if not is_admin(message.from_user.username):
-        return
+    if not is_admin(message.from_user.username): return
     parts = message.text.split()
     if len(parts) != 3:
         await message.reply("Использование: /plan @username число")
         return
-    username = parts[1].lstrip("@")
-    plan = int(parts[2])
-    db.set_plan(username, plan)
-    await message.reply(f"✅ План для @{username} установлен: {plan}")
+    db.set_plan(parts[1].lstrip("@"), int(parts[2]))
+    await message.reply(f"✅ План для {parts[1]} = {parts[2]}")
 
 @router.message(F.text.startswith("/sales_month"))
 async def cmd_sales_month(message: Message):
-    if not is_admin(message.from_user.username):
-        return
+    if not is_admin(message.from_user.username): return
     data = db.get_sales_month()
-    if not data:
-        await message.reply("📊 Продажи с начала месяца: пока нет данных.")
+    if not data: 
+        await message.reply("📊 Нет данных.")
         return
-    txt = "📊 Продажи с начала месяца:\n"
+    txt = "📊 Продажи месяца:\n"
     for username, qty, plan, net in data:
         percent = int(qty / plan * 100) if plan else 0
-        txt += f"@{username} ({net}): {qty} / план {plan or '-'} → {percent}%\n"
-    await message.reply(txt)
-
-@router.message(F.text.startswith("/stocks"))
-async def cmd_stocks(message: Message):
-    if not is_admin(message.from_user.username):
-        return
-    rows = db.get_stocks()
-    if not rows:
-        await message.reply("📦 Нет данных по стокам.")
-        return
-    txt = "📦 Стоки:\n"
-    for u, item, qty, net, upd in rows:
-        txt += f"@{u} {item}: {qty} (сеть: {net}, {upd})\n"
+        txt += f"@{username} ({net}): {qty}/{plan or '-'} ({percent}%)\n"
     await message.reply(txt)
 
 # --------------------------
@@ -209,28 +201,23 @@ async def cmd_stocks(message: Message):
 async def daily_report():
     today = datetime.now(tz).strftime("%Y-%m-%d")
     sales = db.get_sales_all(today)
-    if not sales:
-        txt = f"📊 Продажи за {today}: пока нет данных."
-    else:
-        txt = f"📊 Продажи за {today}:\n"
+    txt = f"📊 Продажи за {today}:\n" if sales else f"📊 {today}: нет данных."
+    if sales:
         for u, qty, plan, net in sales:
             percent = int(qty / plan * 100) if plan else 0
-            txt += f"@{u} ({net}): {qty} / {plan or '-'} ({percent}%)\n"
+            txt += f"@{u} ({net}): {qty}/{plan or '-'} ({percent}%)\n"
     await bot.send_message(GROUP_CHAT_ID, txt)
 
 async def weekly_projection():
     today = datetime.now(tz)
-    day_of_month = today.day
+    day = today.day
     total_days = calendar.monthrange(today.year, today.month)[1]
     data = db.get_sales_month()
-    if not data:
-        return
-    txt = "🔮 Прогноз выполнения плана:\n"
+    if not data: return
+    txt = "🔮 Прогноз:\n"
     for u, qty, plan, net in data:
-        if not plan or plan == 0:
-            continue
-        avg = qty / day_of_month
-        forecast = int(avg * total_days)
+        if not plan: continue
+        forecast = int((qty / day) * total_days)
         percent = int(forecast / plan * 100)
         txt += f"@{u} ({net}): {qty}/{plan}, прогноз {forecast} ({percent}%)\n"
     await bot.send_message(GROUP_CHAT_ID, txt)
@@ -238,33 +225,19 @@ async def weekly_projection():
 async def monthly_report():
     today = datetime.now(tz)
     data = db.get_sales_month()
-    txt = f"📊 Итог продаж за {today.strftime('%B %Y')}:\n"
+    txt = f"📊 Итог {today.strftime('%B %Y')}:\n"
     for u, qty, plan, net in data:
         percent = int(qty / plan * 100) if plan else 0
-        txt += f"@{u} ({net}): {qty} / {plan or '-'} ({percent}%)\n"
+        txt += f"@{u} ({net}): {qty}/{plan or '-'} ({percent}%)\n"
     await bot.send_message(GROUP_CHAT_ID, txt)
     db.reset_monthly_sales()
 
 async def weekly_stock_reminder():
-    await bot.send_message(GROUP_CHAT_ID, "📦 Напомните актуальные остатки, пожалуйста.")
+    await bot.send_message(GROUP_CHAT_ID, "📦 Обновите стоки!")
 
 # --------------------------
-# Fake WebServer for Render
+# MAIN
 # --------------------------
-async def handle(request):
-    return web.Response(text="Bot is running ✅")
-
-async def start_fake_server():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    port = int(os.getenv("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"🌐 Fake server started on port {port}")
-
-# --- Главный цикл ---
 async def main():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(daily_report, "cron", hour=21, minute=0, timezone="Asia/Almaty")
@@ -273,11 +246,20 @@ async def main():
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.start()
 
-    print("🚀 Бот запущен 24/7 ✅")
-    await asyncio.gather(
-        start_fake_server(),
-        dp.start_polling(bot)
-    )
+    # Устанавливаем webhook
+    await bot.set_webhook(WEBHOOK_URL)
+
+    # aiohttp web server
+    app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, dp.webhook_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    await site.start()
+
+    print(f"🚀 Webhook бот запущен на {WEBHOOK_URL}")
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
