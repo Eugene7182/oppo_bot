@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 conn = sqlite3.connect("sales.db")
 cursor = conn.cursor()
@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS sales (
     model TEXT,
     memory TEXT,
     qty INTEGER,
-    date TEXT,
-    network TEXT
+    network TEXT,
+    date TEXT
 )
 """)
 
@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS stok (
     username TEXT,
     item TEXT,
     qty INTEGER,
-    last_update TEXT,
-    network TEXT
+    network TEXT,
+    last_update TEXT
 )
 """)
 
@@ -37,119 +37,60 @@ CREATE TABLE IF NOT EXISTS plans (
 """)
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS user_network (
-    username TEXT PRIMARY KEY,
-    network TEXT
-)
-""")
-
-cursor.execute("""
 CREATE TABLE IF NOT EXISTS admins (
-    username TEXT PRIMARY KEY
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS admin_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin TEXT,
-    action TEXT,
-    ts TEXT
+    username TEXT UNIQUE
 )
 """)
 
 conn.commit()
 
-# --- Админы ---
-def seed_admins_from_env(usernames):
-    for u in usernames:
-        cursor.execute("INSERT OR IGNORE INTO admins (username) VALUES (?)", (u.lower(),))
-    conn.commit()
-
-def is_admin(username):
-    cursor.execute("SELECT 1 FROM admins WHERE username=?", (username.lower(),))
-    return cursor.fetchone() is not None
-
-def add_admin(username):
-    cursor.execute("INSERT OR IGNORE INTO admins (username) VALUES (?)", (username.lower(),))
-    conn.commit()
-
-def del_admin(username):
-    cursor.execute("DELETE FROM admins WHERE username=?", (username.lower(),))
-    conn.commit()
-
-def list_admins():
-    cursor.execute("SELECT username FROM admins ORDER BY username")
-    return [r[0] for r in cursor.fetchall()]
-
-def log_admin_action(admin, action):
-    cursor.execute(
-        "INSERT INTO admin_logs (admin, action, ts) VALUES (?, ?, ?)",
-        (admin, action, datetime.now().strftime("%Y-%m-%d %H:%M"))
-    )
-    conn.commit()
-
-# --- Пользовательские сети ---
-def set_user_network(username, network):
-    cursor.execute("INSERT OR REPLACE INTO user_network (username, network) VALUES (?, ?)", (username, network))
-    conn.commit()
-
-def get_user_network(username):
-    cursor.execute("SELECT network FROM user_network WHERE username=?", (username,))
-    row = cursor.fetchone()
-    return row[0] if row and row[0] else None
-
 # --- Продажи ---
-def add_sale(username, model, memory, qty, network=None):
+def add_sale(username, model, memory, qty, network="-"):
     cursor.execute(
-        "INSERT INTO sales (username, model, memory, qty, date, network) VALUES (?, ?, ?, ?, ?, ?)",
-        (username, model, memory, qty, datetime.now().strftime("%Y-%m-%d"), network)
+        "INSERT INTO sales (username, model, memory, qty, network, date) VALUES (?, ?, ?, ?, ?, ?)",
+        (username, model, memory, qty, network, datetime.now().strftime("%Y-%m-%d"))
     )
     conn.commit()
 
 def get_sales_month():
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
     cursor.execute("""
-        SELECT username, SUM(qty),
-               (SELECT plan FROM plans WHERE plans.username = sales.username)
+        SELECT username, SUM(qty), 
+        (SELECT plan FROM plans WHERE plans.username = sales.username),
+        COALESCE(network, '-')
         FROM sales
         WHERE date>=?
-        GROUP BY username
+        GROUP BY username, network
     """, (month_start,))
     return cursor.fetchall()
 
-def get_sales_month_by_network(network):
+def get_sales_all(date):
+    cursor.execute("""
+        SELECT username, SUM(qty),
+        (SELECT plan FROM plans WHERE plans.username = sales.username),
+        COALESCE(network, '-')
+        FROM sales
+        WHERE date=?
+        GROUP BY username, network
+    """, (date,))
+    return cursor.fetchall()
+
+def get_sales_by_network(network):
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
     cursor.execute("""
         SELECT username, SUM(qty),
-               (SELECT plan FROM plans WHERE plans.username = sales.username)
+        (SELECT plan FROM plans WHERE plans.username = sales.username)
         FROM sales
         WHERE date>=? AND network=?
         GROUP BY username
     """, (month_start, network))
     return cursor.fetchall()
 
-def get_sales_all(date):
-    cursor.execute("""
-        SELECT username, SUM(qty),
-               (SELECT plan FROM plans WHERE plans.username = sales.username)
-        FROM sales
-        WHERE date=?
-        GROUP BY username
-    """, (date,))
-    return cursor.fetchall()
-
-def get_top_sellers(limit=3):
+def reset_monthly_sales():
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
-    cursor.execute("""
-        SELECT username, SUM(qty) AS total_qty
-        FROM sales
-        WHERE date>=?
-        GROUP BY username
-        ORDER BY total_qty DESC
-        LIMIT ?
-    """, (month_start, limit))
-    return cursor.fetchall()
+    cursor.execute("DELETE FROM sales WHERE date>=?", (month_start,))
+    conn.commit()
 
 # --- Планы ---
 def set_plan(username, plan):
@@ -157,39 +98,46 @@ def set_plan(username, plan):
     conn.commit()
 
 # --- Стоки ---
-def update_stock(username, item, qty, network=None):
-    cursor.execute("""
-        SELECT qty FROM stok
-        WHERE username=? AND item=? AND IFNULL(network,'')=IFNULL(?, '')
-    """, (username, item, network))
+def update_stock(username, item, qty, network="-"):
+    cursor.execute("SELECT qty FROM stok WHERE username=? AND item=?", (username, item))
     row = cursor.fetchone()
     if row:
         cursor.execute(
-            "UPDATE stok SET qty=?, last_update=?, network=? WHERE username=? AND item=?",
-            (qty, datetime.now().strftime("%Y-%m-%d %H:%M"), network, username, item)
+            "UPDATE stok SET qty=?, network=?, last_update=? WHERE username=? AND item=?",
+            (qty, network, datetime.now().strftime("%Y-%m-%d %H:%M"), username, item)
         )
     else:
         cursor.execute(
-            "INSERT INTO stok (username, item, qty, last_update, network) VALUES (?, ?, ?, ?, ?)",
-            (username, item, qty, datetime.now().strftime("%Y-%m-%d %H:%M"), network)
+            "INSERT INTO stok (username, item, qty, network, last_update) VALUES (?, ?, ?, ?, ?)",
+            (username, item, qty, network, datetime.now().strftime("%Y-%m-%d %H:%M"))
         )
     conn.commit()
 
-def get_stocks_filtered(username=None, network=None):
-    q = "SELECT username, item, qty, last_update, network FROM stok WHERE 1=1"
-    args = []
+def get_stocks(username=None, network=None):
+    query = "SELECT username, item, qty, network, last_update FROM stok WHERE 1=1"
+    params = []
     if username:
-        q += " AND username=?"
-        args.append(username)
+        query += " AND username=?"
+        params.append(username)
     if network:
-        q += " AND network=?"
-        args.append(network)
-    q += " ORDER BY last_update DESC"
-    cursor.execute(q, tuple(args))
+        query += " AND network=?"
+        params.append(network)
+    cursor.execute(query, tuple(params))
     return cursor.fetchall()
 
-# --- Итог месяца ---
-def reset_monthly_sales():
-    month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
-    cursor.execute("DELETE FROM sales WHERE date>=?", (month_start,))
+# --- Админы ---
+def add_admin(username):
+    cursor.execute("INSERT OR IGNORE INTO admins (username) VALUES (?)", (username,))
     conn.commit()
+
+def del_admin(username):
+    cursor.execute("DELETE FROM admins WHERE username=?", (username,))
+    conn.commit()
+
+def get_admins():
+    cursor.execute("SELECT username FROM admins")
+    return [row[0] for row in cursor.fetchall()]
+
+def is_admin(username):
+    cursor.execute("SELECT 1 FROM admins WHERE username=?", (username,))
+    return cursor.fetchone() is not None
