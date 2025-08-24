@@ -12,7 +12,6 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 import db
 
@@ -23,10 +22,6 @@ TOKEN = os.getenv("BOT_TOKEN", "")
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1002663663535"))
 ADMINS_ENV = os.getenv("ADMINS", "").split(",") if os.getenv("ADMINS") else []
 tz = timezone("Asia/Almaty")
-
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://oppo-bot-k2d2.onrender.com")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -237,9 +232,15 @@ async def weekly_stock_reminder():
     await bot.send_message(GROUP_CHAT_ID, "📦 Обновите стоки!")
 
 # --------------------------
-# MAIN
+# ФЕЙКОВЫЙ WEB SERVICE + POLLING
 # --------------------------
+async def fake_server():
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="Bot is running (polling mode)."))
+    return app
+
 async def main():
+    # Планировщик
     scheduler = AsyncIOScheduler()
     scheduler.add_job(daily_report, "cron", hour=21, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(weekly_projection, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
@@ -247,23 +248,18 @@ async def main():
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.start()
 
-    # --- Сброс старого вебхука и установка нового ---
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
+    # Запуск polling в фоне
+    asyncio.create_task(dp.start_polling(bot))
 
-    # aiohttp web server
-    app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
-
+    # Фейковый веб-сервер (для Render)
+    app = await fake_server()
+    port = int(os.getenv("PORT", 10000))
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    print(f"🚀 Webhook бот запущен на {WEBHOOK_URL}")
-
-    # держим приложение живым
+    print(f"🚀 Bot running in polling mode on port {port}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
