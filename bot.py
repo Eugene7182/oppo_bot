@@ -1,9 +1,11 @@
 import asyncio
 import calendar
 import re
+import os
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pytz import timezone
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message
@@ -11,10 +13,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 import db
-import os
 
 # --- Настройки ---
-TOKEN = os.getenv("BOT_TOKEN", "ТОКЕН_ТУТ")
+TOKEN = os.getenv("BOT_TOKEN", "ТОКЕН_ТУТ")   # обязательно переменная BOT_TOKEN
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1002663663535"))
 ADMINS_ENV = os.getenv("ADMINS", "").split(",") if os.getenv("ADMINS") else []
 tz = timezone("Asia/Almaty")
@@ -128,7 +129,7 @@ async def stock_handler(message: Message):
         await message.reply(f"⚠ Ошибка стока: {e}")
 
 # --------------------------
-# КОМАНДЫ
+# КОМАНДЫ (админские)
 # --------------------------
 @router.message(F.text.startswith("/admins"))
 async def cmd_admins(message: Message):
@@ -189,24 +190,6 @@ async def cmd_sales_month(message: Message):
         txt += f"@{username} ({net}): {qty} / план {plan or '-'} → {percent}%\n"
     await message.reply(txt)
 
-@router.message(F.text.startswith("/daily_report"))
-async def cmd_daily(message: Message):
-    if not is_admin(message.from_user.username):
-        return
-    await daily_report()
-
-@router.message(F.text.startswith("/weekly_projection"))
-async def cmd_projection(message: Message):
-    if not is_admin(message.from_user.username):
-        return
-    await weekly_projection()
-
-@router.message(F.text.startswith("/monthly_report"))
-async def cmd_monthly(message: Message):
-    if not is_admin(message.from_user.username):
-        return
-    await monthly_report()
-
 @router.message(F.text.startswith("/stocks"))
 async def cmd_stocks(message: Message):
     if not is_admin(message.from_user.username):
@@ -218,25 +201,6 @@ async def cmd_stocks(message: Message):
     txt = "📦 Стоки:\n"
     for u, item, qty, net, upd in rows:
         txt += f"@{u} {item}: {qty} (сеть: {net}, {upd})\n"
-    await message.reply(txt)
-
-@router.message(F.text.startswith("/by_network"))
-async def cmd_by_network(message: Message):
-    if not is_admin(message.from_user.username):
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.reply("Использование: /by_network Mechta")
-        return
-    net = parts[1].capitalize()
-    rows = db.get_sales_by_network(net)
-    if not rows:
-        await message.reply(f"📊 Продажи по сети {net}: нет данных.")
-        return
-    txt = f"📊 Продажи по сети {net}:\n"
-    for u, qty, plan in rows:
-        percent = int(qty / plan * 100) if plan else 0
-        txt += f"@{u}: {qty} / {plan or '-'} ({percent}%)\n"
     await message.reply(txt)
 
 # --------------------------
@@ -284,6 +248,22 @@ async def monthly_report():
 async def weekly_stock_reminder():
     await bot.send_message(GROUP_CHAT_ID, "📦 Напомните актуальные остатки, пожалуйста.")
 
+# --------------------------
+# Fake WebServer for Render
+# --------------------------
+async def handle(request):
+    return web.Response(text="Bot is running ✅")
+
+async def start_fake_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    port = int(os.getenv("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Fake server started on port {port}")
+
 # --- Главный цикл ---
 async def main():
     scheduler = AsyncIOScheduler()
@@ -294,7 +274,10 @@ async def main():
     scheduler.start()
 
     print("🚀 Бот запущен 24/7 ✅")
-    await dp.start_polling(bot)
+    await asyncio.gather(
+        start_fake_server(),
+        dp.start_polling(bot)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
