@@ -242,7 +242,7 @@ async def fake_server():
 async def main():
     # Планировщик
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(daily_report, "cron", hour=21, minute=0, timezone="Asia/Almaty")
+    scheduler.add_job(daily_report, "cron", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(weekly_projection, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(weekly_stock_reminder, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
@@ -264,3 +264,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
