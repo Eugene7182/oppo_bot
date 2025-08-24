@@ -12,6 +12,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 import db
 
@@ -252,15 +253,18 @@ async def main():
 
     # aiohttp web server
     app = web.Application()
-    app.router.add_post(WEBHOOK_PATH, dp.webhook_handler)
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
     await site.start()
 
     print(f"🚀 Webhook бот запущен на {WEBHOOK_URL}")
-    while True:
-        await asyncio.sleep(3600)
+
+    # держим приложение живым
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
