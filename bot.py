@@ -16,7 +16,7 @@ from aiohttp import web   # HTTP-сервер для Render
 import db
 
 # --- Настройки ---
-TOKEN = os.getenv("TOKEN")  # секретный токен в Render → Environment
+TOKEN = os.getenv("TOKEN")
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1000000000000"))
 tz = timezone("Asia/Almaty")
 
@@ -102,6 +102,19 @@ async def cmd_sales_month(message: Message):
             report += f"@{username}: {qty} / план {plan or '-'} → {percent}%\n"
         await message.reply(report)
 
+# --- Новая команда: показать стоки ---
+@router.message()
+async def cmd_stocks(message: Message):
+    if message.text.startswith("/stocks"):
+        data = db.get_all_stocks()
+        if not data:
+            await message.reply("📦 Пока нет данных по остаткам.")
+            return
+        report = "📦 Актуальные остатки:\n"
+        for username, item, qty, last_update in data:
+            report += f"@{username}: {item} = {qty} (обновлено {last_update})\n"
+        await message.reply(report)
+
 # --- Автоотчёты ---
 async def daily_report():
     today = datetime.now(tz).strftime("%Y-%m-%d")
@@ -145,9 +158,25 @@ async def monthly_report():
 async def weekly_stock_reminder():
     await bot.send_message(GROUP_CHAT_ID, "📦 Напомните актуальные остатки, пожалуйста.")
 
+# --- Новые команды: ручные отчёты ---
+@router.message()
+async def cmd_daily(message: Message):
+    if message.text.startswith("/daily_report"):
+        await daily_report()
+
+@router.message()
+async def cmd_weekly(message: Message):
+    if message.text.startswith("/weekly_projection"):
+        await weekly_projection()
+
+@router.message()
+async def cmd_monthly(message: Message):
+    if message.text.startswith("/monthly_report"):
+        await monthly_report()
+
 # --- HTTP-сервер для Render ---
 async def handle(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot is running 24/7!")
 
 async def start_web():
     app = web.Application()
@@ -156,21 +185,6 @@ async def start_web():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 5000)))
     await site.start()
-
-# --- Цикл работы бота (08:00–24:00) ---
-async def run_bot_limited():
-    while True:
-        now = datetime.now(tz).time()
-        if 8 <= now.hour < 24:  # активность
-            print("⏰ Время работы (08:00–24:00) — бот запущен ✅")
-            try:
-                await dp.start_polling(bot)
-            except Exception as e:
-                print(f"⚠ Ошибка polling: {e}")
-                await asyncio.sleep(30)
-        else:
-            print("😴 Ночь — бот отдыхает до 08:00")
-            await asyncio.sleep(300)  # проверяем каждые 5 мин
 
 # --- Главная ---
 async def main():
@@ -181,11 +195,10 @@ async def main():
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.start()
 
-    # HTTP-сервер для Render
     await start_web()
 
-    # Ограничение по времени
-    await run_bot_limited()
+    print("🚀 Бот запущен 24/7 ✅")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
