@@ -104,6 +104,10 @@ def update_stock(username, item, qty):
         )
     conn.commit()
 
+def get_all_stocks():
+    cursor.execute("SELECT username, item, qty, last_update FROM stok")
+    return cursor.fetchall()
+
 # --- Фото ---
 def add_photo(username):
     cursor.execute(
