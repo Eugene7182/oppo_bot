@@ -11,11 +11,13 @@ from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
+from aiohttp import web   # HTTP-сервер для Render
+
 import db
 
 # --- Настройки ---
-TOKEN = os.getenv("TOKEN")  # секретный токен, в Render → Environment
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1000000000000"))  # твоя группа
+TOKEN = os.getenv("TOKEN")  # секретный токен в Render → Environment
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1000000000000"))
 tz = timezone("Asia/Almaty")
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -143,6 +145,33 @@ async def monthly_report():
 async def weekly_stock_reminder():
     await bot.send_message(GROUP_CHAT_ID, "📦 Напомните актуальные остатки, пожалуйста.")
 
+# --- HTTP-сервер для Render ---
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 5000)))
+    await site.start()
+
+# --- Цикл работы бота (08:00–24:00) ---
+async def run_bot_limited():
+    while True:
+        now = datetime.now(tz).time()
+        if 8 <= now.hour < 24:  # активность
+            print("⏰ Время работы (08:00–24:00) — бот запущен ✅")
+            try:
+                await dp.start_polling(bot)
+            except Exception as e:
+                print(f"⚠ Ошибка polling: {e}")
+                await asyncio.sleep(30)
+        else:
+            print("😴 Ночь — бот отдыхает до 08:00")
+            await asyncio.sleep(300)  # проверяем каждые 5 мин
+
 # --- Главная ---
 async def main():
     scheduler = AsyncIOScheduler()
@@ -152,8 +181,11 @@ async def main():
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.start()
 
-    print("Бот запущен ✅")
-    await dp.start_polling(bot)
+    # HTTP-сервер для Render
+    await start_web()
+
+    # Ограничение по времени
+    await run_bot_limited()
 
 if __name__ == "__main__":
     asyncio.run(main())
