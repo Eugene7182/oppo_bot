@@ -14,7 +14,7 @@ import db
 import os
 
 # --- Настройки ---
-TOKEN = os.getenv("BOT_TOKEN", "ТОКЕН_ЗДЕСЬ")
+TOKEN = os.getenv("BOT_TOKEN", "ТОКЕН_ТУТ")
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1002663663535"))
 ADMINS_ENV = os.getenv("ADMINS", "").split(",") if os.getenv("ADMINS") else []
 tz = timezone("Asia/Almaty")
@@ -41,53 +41,95 @@ def extract_network(text: str) -> str:
             return net.capitalize()
     return "-"
 
-# --- Обработчики сообщений ---
+# --- Регулярки ---
+SALE_RE = re.compile(r"([a-zа-яё0-9\-\+]+)\s+(\d{2,4}(?:tb|тб)?)\s*(\d+)?", re.IGNORECASE)
+STOCK_RE = re.compile(
+    r"([a-zа-яё0-9\+\-\s]+?)\s*(?:\(?\d+\/)?(\d{2,4})(?:тб|tb)?\)?\s*[-—: ]?\s*(\d+)?",
+    re.IGNORECASE
+)
+
+# --------------------------
+# ПРОДАЖИ
+# --------------------------
 @router.message()
 async def sales_handler(message: Message):
-    if message.chat.id != GROUP_CHAT_ID:
+    if message.chat.id != GROUP_CHAT_ID or not message.text or message.text.startswith("/"):
         return
     text = message.text.strip()
     if "доля" in text.lower():
         return
+
+    network = extract_network(text)
+
     try:
-        pattern = re.compile(
-            r"([a-zа-яё0-9\-\+]+)\s+(\d{2,4}(?:tb|тб)?)\s*(\d+)?",
-            re.IGNORECASE
-        )
-        matches = pattern.findall(text)
+        matches = SALE_RE.findall(text)
         if not matches:
             return
-        network = extract_network(text)
-        for match in matches:
-            model = match[0]
-            memory = match[1]
-            qty = int(match[2]) if match[2] else 1
-            user = message.from_user.username or str(message.from_user.id)
+        user = message.from_user.username or str(message.from_user.id)
+
+        for model_raw, memory, qty_raw in matches:
+            model = model_raw.strip()
+            qty = int(qty_raw) if qty_raw else 1
+            item = f"{model} {memory}"
+
+            # 1) Сохраняем продажу
             db.add_sale(user, model, memory, qty, network)
+
+            # 2) Проверяем остатки
+            stock_qty = db.get_stock_qty(user, item, network)
+            if stock_qty is None:
+                await message.reply(f"⚠ Остаток для {item} не найден. @{user}, обновите сток!")
+            elif stock_qty < qty:
+                await message.reply(
+                    f"⚠ У @{user} не хватает стока для {item} (продажа {qty}, остаток {stock_qty}).\n"
+                    f"👉 Пожалуйста, обновите остатки!"
+                )
+            else:
+                db.decrease_stock(user, item, qty, network)
+
         await message.reply(f"✅ Продажи учтены (сеть: {network})")
     except Exception as e:
         await message.reply(f"⚠ Ошибка: {e}")
 
+# --------------------------
+# СТОКИ
+# --------------------------
 @router.message()
 async def stock_handler(message: Message):
     if message.chat.id != GROUP_CHAT_ID:
         return
     text = message.text.strip()
-    if any(w in text.lower() for w in ["приход", "остаток", "сток", "приехал"]):
-        try:
-            parts = text.split()
-            if len(parts) < 2:
-                return
-            item = parts[0]
-            qty = int(parts[1])
-            network = extract_network(text)
-            user = message.from_user.username or str(message.from_user.id)
-            db.update_stock(user, item, qty, network)
-            await message.reply(f"📦 Сток обновлён: {item} = {qty} (сеть: {network})")
-        except Exception as e:
-            await message.reply(f"⚠ Ошибка стока: {e}")
 
-# --- Команды ---
+    if not any(w in text.lower() for w in ["сток", "остаток", "stock", "stocks", "приход", "приехал"]):
+        return
+
+    try:
+        rows = text.splitlines()
+        user = message.from_user.username or str(message.from_user.id)
+        network = extract_network(text)
+
+        updated_items = []
+        for row in rows:
+            match = STOCK_RE.search(row)
+            if not match:
+                continue
+            model = match.group(1).strip().replace("  ", " ")
+            memory = match.group(2)
+            qty = int(match.group(3)) if match.group(3) else 0
+            item_name = f"{model} {memory}"
+            db.update_stock(user, item_name, qty, network)
+            updated_items.append(f"{item_name} = {qty}")
+
+        if updated_items:
+            await message.reply("📦 Обновлено:\n" + "\n".join(updated_items) + f"\n(сеть: {network})")
+        else:
+            await message.reply("⚠ Не удалось распознать позиции в сообщении.")
+    except Exception as e:
+        await message.reply(f"⚠ Ошибка стока: {e}")
+
+# --------------------------
+# КОМАНДЫ
+# --------------------------
 @router.message(F.text.startswith("/admins"))
 async def cmd_admins(message: Message):
     if not is_admin(message.from_user.username):
@@ -169,16 +211,7 @@ async def cmd_monthly(message: Message):
 async def cmd_stocks(message: Message):
     if not is_admin(message.from_user.username):
         return
-    parts = message.text.split()
-    user = None
-    net = None
-    if len(parts) >= 2:
-        for p in parts[1:]:
-            if p.startswith("@"):
-                user = p.lstrip("@")
-            elif p.capitalize() in [n.capitalize() for n in NETWORKS]:
-                net = p.capitalize()
-    rows = db.get_stocks(user, net)
+    rows = db.get_stocks()
     if not rows:
         await message.reply("📦 Нет данных по стокам.")
         return
@@ -206,7 +239,9 @@ async def cmd_by_network(message: Message):
         txt += f"@{u}: {qty} / {plan or '-'} ({percent}%)\n"
     await message.reply(txt)
 
-# --- Автоотчёты ---
+# --------------------------
+# ОТЧЁТЫ (scheduler)
+# --------------------------
 async def daily_report():
     today = datetime.now(tz).strftime("%Y-%m-%d")
     sales = db.get_sales_all(today)
