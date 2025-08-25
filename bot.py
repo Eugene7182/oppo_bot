@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Production bot.py (aiogram v3, webhook, keep-alive, APScheduler)
+Production bot.py (aiogram v3.7+, webhook, keep-alive, APScheduler)
 Зависимости (requirements.txt):
-aiogram>=3.5
+aiogram>=3.7
 aiohttp>=3.9
 apscheduler>=3.10
 pytz
@@ -24,6 +24,7 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message
 from aiogram.filters import Command
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -36,7 +37,7 @@ try:
 except Exception:
     HAS_SQLA = False
 
-# Твой модуль работы с БД
+# Твой модуль работы с БД (мы уже сделали совместимый db.Repo в db.py)
 import db  # ОЖИДАЕМ db.Repo(...)
 
 # =============================================================================
@@ -56,7 +57,7 @@ GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
 ADMIN_TG_ID = int(os.getenv("ADMIN_TG_ID", "0"))  # задай свой Telegram user id
 
 # Таймзона и планировщик
-TZ = timezone("Asia/Almaty")
+TZ = timezone(os.getenv("TZ", "Asia/Almaty"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")  # если задашь, jobstore будет персистентным
 
 # Keep-alive
@@ -65,8 +66,9 @@ KEEPALIVE_PATH = os.getenv("KEEPALIVE_PATH", "/")
 KEEPALIVE_INTERVAL_MIN = int(os.getenv("KEEPALIVE_INTERVAL_MIN", "4"))
 
 # Поведение по стоку/тише
-SILENT_UNBOUND = True  # если нет привязки сети у автора — полная тишина
+SILENT_UNBOUND = os.getenv("SILENT_UNBOUND", "1") == "1"  # если нет привязки сети у автора — молчим
 STRICT_STOCK_PROMPT = True  # просим обновить сток редко и не чаще 1 раза/день/сеть
+RECOVERY_MODE = os.getenv("RECOVERY_MODE", "0") == "1"    # 0 — никого ни о чём не просим (твои привязки живы)
 
 # =============================================================================
 # Логирование
@@ -85,9 +87,6 @@ IGNORE_WHOLE_MSG_IF_CONTAINS = ("доля",)
 SALE_MARKERS = ("продал", "продажа", "прод.", "sale", "шт", "шт.")
 STOCK_INC_MARKERS = ("приход", "поступил", "получили", "привезли")
 STOCK_SNAPSHOT_PREFIXES = ("сток:", "остаток:", "новый сток:")
-
-MEM_TB_TOKENS = ("1тб", "1tb", "1 tb", "1 тб")
-VALID_MEM = {"64", "128", "256", "512", "1024"}
 
 SPACE_RE = re.compile(r"\s+")
 PRICE_RE = re.compile(r"(\d[\d\s]{3,})\s*(?:тг|тенге|₸|kzt)", re.IGNORECASE)
@@ -116,7 +115,7 @@ def _strip_prices(s: str) -> str:
 def _extract_qty(s: str) -> Optional[int]:
     s = _norm(s)
     s_wo_gb = GB_SUFFIX_RE.sub("", s)
-    for tb in MEM_TB_TOKENS:
+    for tb in ("1тб", "1tb", "1 tb", "1 тб"):
         s_wo_gb = s_wo_gb.replace(tb, "")
     m = re.search(r'(?:[-—:]\s*(\d+)\s*$)|(?:x\s*(\d+)\s*$)|(?:\b(\d+)\s*шт\.?\s*$)|(?:\s(\d+)\s*$)', s_wo_gb)
     if m:
@@ -135,7 +134,7 @@ def _extract_mem(s: str) -> Optional[int]:
     m = RAM_ROM_RE.search(L)
     if m:
         mem = m.group(2)
-        if mem in VALID_MEM:
+        if mem in {"64", "128", "256", "512", "1024"}:
             return int(mem)
     m2 = re.search(r'\b(64|128|256|512|1024)\b', L)
     if m2:
@@ -147,7 +146,7 @@ def _clean_model_fragment(s: str) -> str:
     s = _norm(s)
     s = RAM_ROM_RE.sub(" ", s)
     s = GB_SUFFIX_RE.sub(" ", s)
-    for tb in MEM_TB_TOKENS:
+    for tb in ("1тб", "1tb", "1 tb", "1 тб"):
         s = s.replace(tb, " ")
     s = re.sub(r'\b(64|128|256|512|1024)\b', " ", s)
     s = re.sub(r'[-—:]\s*\d+\s*$', " ", s)
@@ -235,7 +234,7 @@ class RepoMiddleware(BaseMiddleware):
 # Бот/диспетчер/роутер
 # =============================================================================
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -272,7 +271,7 @@ async def bind_network(m: Message, repo: db.Repo):
     """
     Пользователь сам может привязаться:
     Формат: "сеть: <название>, <город>[, <адрес>]"
-    Для Павлодара адрес обязателен. Для Аксу/Экибастуза нужен город.
+    Для Павлодара адрес обязателен (Только если RECOVERY_MODE=1). Для Аксу/Экибастуза нужен город.
     """
     try:
         raw = m.text.split(":", 1)[1].strip()
@@ -285,18 +284,17 @@ async def bind_network(m: Message, repo: db.Repo):
 
     if not name:
         return
-    # Валидация по городам
-    if city is None and any(x in name.lower() for x in ("аксу", "экибастуз", "ekibastuz", "aksu")):
+    if city is None and any(x in (name or "").lower() for x in ("аксу", "экибастуз", "ekibastuz", "aksu")):
         city = "Аксу" if "аксу" in name.lower() else "Экибастуз"
-    # Павлодар → обязателен адрес
-    if city and "павлодар" in city.lower() and not address:
+
+    if RECOVERY_MODE and city and "павлодар" in city.lower() and not address:
         await m.answer("Для Павлодара укажите адрес: сеть: <название>, Павлодар, <адрес>")
         return
 
     await repo.ensure_network(name=name, city=city, address=address)
     await repo.bind_by_tgid(m.from_user.id, name)
-    # По твоим правилам — без лишних сообщений. Можно ответить коротко:
-    await m.answer(f"Привязал к сети: {name}")
+    if not SILENT_UNBOUND:
+        await m.answer(f"Привязал к сети: {name}")
 
 @router.message(Command("set_network"))
 async def cmd_set_network(m: Message, repo: db.Repo):
@@ -339,7 +337,7 @@ async def cmd_set_netinfo(m: Message, repo: db.Repo):
             kv[k.lower()] = v
     city = kv.get("city")
     address = kv.get("address")
-    if city and "павлодар" in city.lower() and not address:
+    if RECOVERY_MODE and city and "павлодар" in city.lower() and not address:
         await m.answer("Для Павлодара нужен address=<адрес>")
         return
     await repo.ensure_network(name=name, city=city, address=address)
@@ -367,7 +365,7 @@ async def cmd_plan(m: Message, repo: db.Repo):
             kv[k.lower()] = v
     city = kv.get("город") or kv.get("city")
     address = kv.get("адрес") or kv.get("address")
-    if city and "павлодар" in city.lower() and not address:
+    if RECOVERY_MODE and city and "павлодар" in city.lower() and not address:
         await m.answer("Для Павлодара нужен адрес")
         return
     await repo.ensure_network(name=net, city=city, address=address)
@@ -455,7 +453,7 @@ async def on_text(m: Message, repo: db.Repo):
     if kind == "ignore":
         return
 
-    # Привязка автора к сети обязательна (но мы не подсказываем — полная тишина)
+    # Привязка автора к сети обязательна (мы молчим, если нет)
     person = await repo.get_person_by_tg(m.from_user.id)
     if not person:
         if SILENT_UNBOUND:
@@ -489,13 +487,13 @@ async def on_text(m: Message, repo: db.Repo):
 # Реализация бизнес-логики
 # =============================================================================
 
-async def resolve_product_from_stock_first(repo: db.Repo, network_id: int, raw_model: str) -> Tuple[Optional[int], str]:
+async def resolve_product_from_stock_first(repo: db.Repo, network_id: int | str, raw_model: str) -> Tuple[Optional[str], str]:
     """
     1) кандидаты из стока сети (порог мягче),
     2) кандидаты из всего каталога/алиасов (порог строже).
     repo должен реализовать:
-      - get_network_stock_candidates(network_id) -> List[Tuple[int, str]]
-      - get_product_candidates_with_aliases() -> List[Tuple[int, str]]
+      - get_network_stock_candidates(network_id) -> List[Tuple[id:str, display:str]]
+      - get_product_candidates_with_aliases() -> List[Tuple[id:str, display:str]]
     """
     from rapidfuzz import process, fuzz
 
@@ -521,9 +519,8 @@ async def resolve_product_from_stock_first(repo: db.Repo, network_id: int, raw_m
 
     return None, raw_model
 
-async def handle_sale(m: Message, repo: db.Repo, network_id: int, net: Any):
+async def handle_sale(m: Message, repo: db.Repo, network_id: int | str, net: Any):
     wrote_any = False
-    prompted_today = False
     items = parse_sales_message(m.text or "")
     for it in items:
         pid, canonical = await resolve_product_from_stock_first(repo, network_id, it["model_raw"])
@@ -552,17 +549,14 @@ async def handle_sale(m: Message, repo: db.Repo, network_id: int, net: Any):
         if new_qty < 0:
             if STRICT_STOCK_PROMPT and await repo.prompt_needed_today(network_id, kind="negative"):
                 await safe_send(m.chat.id, "Остаток ушёл в минус, обновите сток.")
-                prompted_today = True
         else:
-            # Если сеть инициализирована, но модели не было в стоке (создали позицию впервые) — new_qty мог быть >=0.
-            # Просьбу в этом случае **не шлём**, пока не будет реального минуса (по твоим правилам).
+            # Если сети ещё не было позиции — не просим до реального минуса (как договорились).
             pass
 
     if wrote_any:
         await repo.touch_last_sale((await repo.get_person_by_tg(m.from_user.id)).id)
-        # Если сеть не инициализирована — НЕ просим сток, пока не будет минуса. (как договорились)
 
-async def handle_stock_inc(m: Message, repo: db.Repo, network_id: int):
+async def handle_stock_inc(m: Message, repo: db.Repo, network_id: int | str):
     # инкремент построчно
     for line in (l for l in (m.text or "").splitlines() if l.strip()):
         if classify_message(line) != "stock_inc":
@@ -583,22 +577,20 @@ async def handle_stock_inc(m: Message, repo: db.Repo, network_id: int):
         await repo.add_stock(network_id, pid, mem or 0, +qty)
     # никаких просьб «сверить» — ждём явный снапшот
 
-async def handle_stock_snapshot(m: Message, repo: db.Repo, network_id: int):
+async def handle_stock_snapshot(m: Message, repo: db.Repo, network_id: int | str):
     # строки после заголовка
-    rows: List[Tuple[int, int, int]] = []
+    rows: List[Tuple[str, int, int]] = []
     for line in (m.text or "").splitlines()[1:]:
         l = line.strip()
         if not l:
             continue
-        # пытаемся извлечь qty: «— 3», «- 7», «: 5»
         qty = _extract_qty(l)
-        # память может быть, а может нет
         mem = _extract_mem(l)
         pid, _ = await resolve_product_from_stock_first(repo, network_id, _clean_model_fragment(l))
         if pid and qty is not None:
             rows.append((pid, mem or 0, qty))
 
-    # атомарная замена стока + помечаем сеть как инициализированную
+    # атомарная замена стока + помечаем сеть как инициализированную + чистим флаги
     async with repo.tx():
         await repo.replace_stock_snapshot(network_id, rows)
         await repo.set_network_initialized(network_id, True)
@@ -678,7 +670,7 @@ async def keepalive_ping():
             async with s.head(url, headers=headers) as r:
                 if r.status >= 400:
                     async with s.get(url, headers=headers) as rr:
-                        pass
+                        _ = await rr.text()
     except Exception as e:
         log.debug("keepalive error: %s", e)
 
