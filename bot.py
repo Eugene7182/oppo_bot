@@ -280,7 +280,7 @@ async def cmd_help(message: Message):
     ]
     await message.reply("\n".join(txt))
 
-@router.message(Command("admins_show")))
+@router.message(Command("admins_show"))
 async def cmd_admins_show(message: Message):
     if not await admin_guard(message):
         return
@@ -288,7 +288,7 @@ async def cmd_admins_show(message: Message):
     dbs = ", ".join(f"@{u}" for u in list_admins_safe()) or "—"
     await message.reply(f"👮 ENV: {env}\n👮 DB: {dbs}")
 
-@router.message(Command("admin_add")))
+@router.message(Command("admin_add"))
 async def cmd_admin_add(message: Message):
     if not await admin_guard(message):
         return
@@ -299,7 +299,7 @@ async def cmd_admin_add(message: Message):
     db.add_admin(u)
     await message.reply(f"✅ @{u} теперь админ.")
 
-@router.message(Command("admin_remove")))
+@router.message(Command("admin_remove"))
 async def cmd_admin_remove(message: Message):
     if not await admin_guard(message):
         return
@@ -310,7 +310,7 @@ async def cmd_admin_remove(message: Message):
     db.remove_admin(u)
     await message.reply(f"🗑️ @{u} удалён из админов.")
 
-@router.message(Command("set_network")))
+@router.message(Command("set_network"))
 async def cmd_set_network(message: Message):
     if not await admin_guard(message):
         return
@@ -324,7 +324,7 @@ async def cmd_set_network(message: Message):
     db.set_network(u, "-" if network == "-" else network)
     await message.reply(f"🔗 {human_network_or_user(u)} → сеть: {network if network!='-' else '—'}")
 
-@router.message(Command("stocks")))
+@router.message(Command("stocks"))
 async def cmd_stocks(message: Message):
     # /stocks [@user|user_id|network] [network_filter]
     parts = (message.text or "").split()
@@ -358,7 +358,7 @@ async def cmd_stocks(message: Message):
         lines.append(f"{item} — {qty}")
     await message.reply("\n".join(lines))
 
-@router.message(Command("sales_month")))
+@router.message(Command("sales_month"))
 async def cmd_sales_month(message: Message):
     parts = (message.text or "").split()
     args = parts[1:]
@@ -399,7 +399,7 @@ async def cmd_sales_month(message: Message):
             lines.append(f"• {m} — {s}")
     await message.reply("\n".join(lines))
 
-@router.message(Command("set_sales")))
+@router.message(Command("set_sales"))
 async def cmd_set_sales(message: Message):
     if not await admin_guard(message):
         return
@@ -432,7 +432,7 @@ async def cmd_set_sales(message: Message):
     except Exception as e:
         await message.reply(f"⚠️ Ошибка: {e}")
 
-@router.message(Command("set_plan")))
+@router.message(Command("set_plan"))
 async def cmd_set_plan(message: Message):
     if not await admin_guard(message):
         return
@@ -471,7 +471,7 @@ async def cmd_set_plan(message: Message):
     db.set_plan(tgt_user, ym_key, plan_val)
     await message.reply(f"✅ План {human_network_or_user(tgt_user)}: {plan_val} на {ym_key}")
 
-@router.message(Command("plan_show")))
+@router.message(Command("plan_show"))
 async def cmd_plan_show(message: Message):
     # /plan_show [YYYY-MM]
     parts = (message.text or "").split()
@@ -492,7 +492,7 @@ async def cmd_plan_show(message: Message):
         lines.append(f"{human_network_or_user(u)}: план {p} | факт {total} | {pct(total, p)}")
     await message.reply("\n".join(lines))
 
-@router.message(Command("set_fact")))
+@router.message(Command("set_fact"))
 async def cmd_set_fact(message: Message):
     """
     /set_fact <@user|user_id|network> <QTY> [YYYY-MM]
@@ -536,7 +536,7 @@ async def cmd_set_fact(message: Message):
     except Exception as e:
         await message.reply(f"⚠️ Ошибка: {e}")
 
-@router.message(Command("add_fact")))
+@router.message(Command("add_fact"))
 async def cmd_add_fact(message: Message):
     """
     /add_fact <@user|user_id|network> <QTY> [YYYY-MM]
