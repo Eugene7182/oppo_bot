@@ -1,175 +1,302 @@
-import os
 import sqlite3
-import threading
-from datetime import datetime
+import re
 from difflib import SequenceMatcher
-from typing import Optional, Tuple, List, Dict
+from datetime import datetime
+from pytz import timezone
 
-DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
+DB_NAME = "sales.db"
+tz = timezone("Asia/Almaty")
 
-_lock = threading.Lock()
-
-def _connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# =========================
+# --- ИНИЦИАЛИЗАЦИЯ/МИГРАЦИИ
+# =========================
 def init():
-    with _lock, _connect() as cx:
-        cx.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS admins(
-                username TEXT PRIMARY KEY
-            );
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
 
-            CREATE TABLE IF NOT EXISTS user_networks(
-                username TEXT PRIMARY KEY,
-                network  TEXT NOT NULL DEFAULT '-'
-            );
-
-            CREATE TABLE IF NOT EXISTS stocks(
-                username TEXT NOT NULL,
-                item     TEXT NOT NULL,
-                qty      INTEGER NOT NULL DEFAULT 0,
-                network  TEXT NOT NULL DEFAULT '-',
-                PRIMARY KEY(username, item, network)
-            );
-
-            CREATE TABLE IF NOT EXISTS sales(
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL,
-                model    TEXT NOT NULL,   -- normalized model: 'reno11f5g'
-                memory   TEXT NOT NULL,   -- '128'
-                qty      INTEGER NOT NULL,
-                network  TEXT NOT NULL DEFAULT '-',
-                ts       TEXT NOT NULL    -- ISO timestamp UTC-like (we keep local Asia/Almaty textual time ok)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_sales_user_month ON sales(username, ts);
-            CREATE INDEX IF NOT EXISTS idx_sales_model_mem ON sales(model, memory);
-
-            CREATE TABLE IF NOT EXISTS plans(
-                username TEXT NOT NULL,
-                ym       TEXT NOT NULL,   -- 'YYYY-MM'
-                plan     INTEGER NOT NULL,
-                PRIMARY KEY(username, ym)
-            );
-            """
+    # sales
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            model TEXT,
+            memory TEXT,
+            qty INTEGER,
+            network TEXT,
+            date TEXT
         )
+    """)
 
-# ================
-# --- Админы ---
-# ================
-def is_admin(username: str) -> bool:
-    username = (username or "").lstrip("@")
-    with _lock, _connect() as cx:
-        r = cx.execute("SELECT 1 FROM admins WHERE username=?", (username,)).fetchone()
-        return r is not None
+    # stocks
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stocks (
+            username TEXT,
+            item TEXT,
+            qty INTEGER,
+            network TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (username, item, network)
+        )
+    """)
 
+    # admins
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            username TEXT PRIMARY KEY
+        )
+    """)
+
+    # networks
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS networks (
+            username TEXT PRIMARY KEY,
+            network TEXT
+        )
+    """)
+
+    # plans v2: с ключом YM
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS plans (
+            username TEXT,
+            ym TEXT,
+            plan INTEGER,
+            PRIMARY KEY (username, ym)
+        )
+    """)
+
+    # --- Миграция со старой схемы plans (username, plan) ---
+    # если обнаружится старая таблица без ym, попробуем её распознать и перенести
+    cur.execute("PRAGMA table_info(plans)")
+    cols = [r[1] for r in cur.fetchall()]
+    if cols == ["username", "plan"]:  # старая схема
+        # создаём новую
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS plans_v2 (
+                username TEXT,
+                ym TEXT,
+                plan INTEGER,
+                PRIMARY KEY (username, ym)
+            )
+        """)
+        # переносим в текущий месяц
+        ym = datetime.now(tz).strftime("%Y-%m")
+        cur.execute("INSERT OR IGNORE INTO plans_v2 (username, ym, plan) SELECT username, ?, plan FROM plans", (ym,))
+        # подменяем
+        cur.execute("DROP TABLE plans")
+        cur.execute("ALTER TABLE plans_v2 RENAME TO plans")
+
+    conn.commit()
+    conn.close()
+
+# =========================
+# --- АДМИНЫ ---
+# =========================
 def add_admin(username: str):
-    username = username.lstrip("@")
-    with _lock, _connect() as cx:
-        cx.execute("INSERT OR IGNORE INTO admins(username) VALUES (?)", (username,))
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT OR IGNORE INTO admins (username) VALUES (?)", (username,))
 
 def remove_admin(username: str):
-    username = username.lstrip("@")
-    with _lock, _connect() as cx:
-        cx.execute("DELETE FROM admins WHERE username=?", (username,))
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("DELETE FROM admins WHERE username=?", (username,))
 
-def list_admins() -> List[str]:
-    with _lock, _connect() as cx:
-        rows = cx.execute("SELECT username FROM admins ORDER BY username").fetchall()
-        return [r["username"] for r in rows]
+def is_admin(username: str) -> bool:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute("SELECT 1 FROM admins WHERE username=?", (username,))
+        return bool(cur.fetchone())
 
-# ==================
-# --- Сети (bind)
-# ==================
+def list_admins():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute("SELECT username FROM admins")
+        return [r[0] for r in cur.fetchall()]
+
+# back-compat
+def get_admins():
+    return list_admins()
+
+# =========================
+# --- СЕТИ ---
+# =========================
 def set_network(username: str, network: str):
-    username = username.lstrip("@")
-    net = network if network else "-"
-    with _lock, _connect() as cx:
-        cx.execute(
-            "INSERT INTO user_networks(username, network) VALUES(?, ?) "
-            "ON CONFLICT(username) DO UPDATE SET network=excluded.network",
-            (username, net)
-        )
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            INSERT INTO networks (username, network)
+            VALUES (?, ?)
+            ON CONFLICT(username) DO UPDATE SET network=excluded.network
+        """, (username, network))
 
-def get_network(username: str) -> Optional[str]:
-    username = username.lstrip("@")
-    with _lock, _connect() as cx:
-        r = cx.execute("SELECT network FROM user_networks WHERE username=?", (username,)).fetchone()
-        return r["network"] if r else None
+def get_network(username: str) -> str:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute("SELECT network FROM networks WHERE username=?", (username,))
+        row = cur.fetchone()
+        return row[0] if row else "-"
 
-# ==================
-# --- Стоки
-# ==================
-def update_stock(username: str, item: str, qty: int, network: str = "-"):
-    username = username.lstrip("@")
-    net = network if network else "-"
-    with _lock, _connect() as cx:
-        cx.execute(
-            "INSERT INTO stocks(username, item, qty, network) VALUES(?, ?, ?, ?) "
-            "ON CONFLICT(username, item, network) DO UPDATE SET qty=excluded.qty",
-            (username, item, int(qty), net)
-        )
+# =========================
+# --- ПЛАНЫ ---
+# =========================
+def set_plan(username: str, ym: str, plan: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            INSERT INTO plans (username, ym, plan)
+            VALUES (?, ?, ?)
+            ON CONFLICT(username, ym) DO UPDATE SET plan=excluded.plan
+        """, (username, ym, plan))
 
-def get_stocks(username: Optional[str] = None, network: Optional[str] = None) -> List[tuple]:
-    # Возвращаем как [(username, item, qty, network), ...]
-    q = "SELECT username, item, qty, network FROM stocks"
-    cond = []
-    args = []
+def get_plan(username: str, ym: str) -> int:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute("SELECT plan FROM plans WHERE username=? AND ym=?", (username, ym))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+def get_all_plans(ym: str) -> dict:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute("SELECT username, plan FROM plans WHERE ym=?", (ym,))
+        return {u: int(p) for u, p in cur.fetchall()}
+
+# =========================
+# --- ПРОДАЖИ ---
+# =========================
+def _today() -> str:
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+def add_sale(username: str, model: str, memory: str, qty: int, network: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            INSERT INTO sales (username, model, memory, qty, network, date)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (username, model, memory, qty, network, _today()))
+
+def month_sales(year: int, month: int, username: str | None = None):
+    ym = f"{year:04d}-{month:02d}"
+    params = [ym + "%"]
+    where = "date LIKE ?"
     if username:
-        cond.append("username=?")
-        args.append(username.lstrip("@"))
-    if network:
-        cond.append("network=?")
-        args.append(network)
-    if cond:
-        q += " WHERE " + " AND ".join(cond)
-    q += " ORDER BY username, item"
-    with _lock, _connect() as cx:
-        rows = cx.execute(q, args).fetchall()
-        return [(r["username"], r["item"], r["qty"], r["network"]) for r in rows]
+        where += " AND username=?"
+        params.append(username)
+    by_model = {}
+    total = 0
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute(f"""
+            SELECT model, SUM(qty)
+            FROM sales
+            WHERE {where}
+            GROUP BY model
+        """, params)
+        for m, s in cur.fetchall():
+            s = int(s or 0)
+            by_model[m] = s
+            total += s
+    return total, by_model
 
-def decrease_stock(username: str, item: str, qty: int, network: str = "-"):
-    username = username.lstrip("@")
-    net = network if network else "-"
-    with _lock, _connect() as cx:
-        r = cx.execute(
-            "SELECT qty FROM stocks WHERE username=? AND item=? AND network=?",
-            (username, item, net)
-        ).fetchone()
-        if not r:
+def get_last_sale(username: str):
+    """Back-compat: вернуть дату последней продажи строкой YYYY-MM-DD."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute("SELECT date FROM sales WHERE username=? ORDER BY date DESC LIMIT 1", (username,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+def get_last_sale_time(username: str):
+    """Современный вариант: вернуть datetime с TZ."""
+    s = get_last_sale(username)
+    if not s:
+        return None
+    return tz.localize(datetime.strptime(s, "%Y-%m-%d"))
+
+def reset_monthly_sales():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("DELETE FROM sales")
+
+# =========================
+# --- СТОКИ ---
+# =========================
+def update_stock(username: str, item: str, qty: int, network: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            INSERT INTO stocks (username, item, qty, network, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(username, item, network)
+            DO UPDATE SET qty=excluded.qty, updated_at=excluded.updated_at
+        """, (username, item, qty, network, datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")))
+
+def get_stock_qty(username: str, item: str, network: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute("""
+            SELECT qty FROM stocks
+            WHERE username=? AND item=? AND network=?
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """, (username, item, network))
+        row = cur.fetchone()
+        return int(row[0]) if row else None
+
+def decrease_stock(username: str, item: str, qty: int, network: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        # не уходим в минус
+        cur = conn.execute("""
+            SELECT qty FROM stocks WHERE username=? AND item=? AND network=?
+        """, (username, item, network))
+        row = cur.fetchone()
+        if not row:
             return
-        newq = max(0, int(r["qty"]) - int(qty))
-        cx.execute(
-            "UPDATE stocks SET qty=? WHERE username=? AND item=? AND network=?",
-            (newq, username, item, net)
-        )
+        new_qty = max(0, int(row[0]) - qty)
+        conn.execute("""
+            UPDATE stocks SET qty=?, updated_at=? WHERE username=? AND item=? AND network=?
+        """, (new_qty, datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S"), username, item, network))
+
+def get_stocks(username: str | None = None, network: str | None = None):
+    """
+    Если передан username (и/или network) — вернуть [(username, item, qty, network)].
+    Если не передано — вернуть полный список с updated_at для универсальных проверок.
+    """
+    with sqlite3.connect(DB_NAME) as conn:
+        if username or network:
+            where = []
+            params = []
+            if username:
+                where.append("username=?")
+                params.append(username)
+            if network:
+                where.append("network=?")
+                params.append(network)
+            where_sql = "WHERE " + " AND ".join(where) if where else ""
+            cur = conn.execute(f"""
+                SELECT username, item, qty, network
+                FROM stocks
+                {where_sql}
+                ORDER BY updated_at DESC
+            """, params)
+            return [(u, i, int(q), n) for (u, i, q, n) in cur.fetchall()]
+        else:
+            cur = conn.execute("""
+                SELECT username, item, qty, network, updated_at
+                FROM stocks
+                ORDER BY updated_at DESC
+            """)
+            return [(u, i, int(q), n, t) for (u, i, q, n, t) in cur.fetchall()]
+
+# =========================
+# --- ФУЗЗИ ПОИСК СТОКА ---
+# =========================
+_norm_rx = re.compile(r"[a-z0-9]+")
 
 def _normalize(s: str) -> str:
-    return "".join(re.findall(r"[a-z0-9]+", s.lower()))
+    return "".join(_norm_rx.findall(s.lower()))
 
-def find_stock_like(username: str, model_norm: str, memory: str, network: str = "-") -> Tuple[Optional[str], int]:
+def find_stock_like(username: str, model_norm: str, memory: str, network: str = "-"):
     """
-    Ищем лучший матч среди стоков пользователя по близости к model_norm + совпадение памяти.
-    Возвращаем (item_name, qty) или (None, 0)
+    Ищем лучший матч среди стоков пользователя:
+    - сравниваем нормализованную модель со стоковым item
+    - память (128/256/512...) должна совпасть по числу
+    - выбираем максимум по similarity ratio
+    - порог 0.55, чтобы не хватать мусор
+    Возвращаем (item_name, qty) или (None, 0).
     """
-    username = username.lstrip("@")
-    net = network if network else "-"
-    candidates = get_stocks(username=username, network=net)
+    candidates = get_stocks(username=username, network=network)
     best_item = None
     best_score = 0.0
     best_qty = 0
-    for _, item, qty, _ in candidates:
-        # item типа "Reno 11F 5G 128"
+    for _, item, qty, _net in candidates:
         mem_match = re.search(r"(\d{2,4})", item)
-        if not mem_match:
-            continue
-        mem = mem_match.group(1)
-        if mem != str(memory):
+        if not mem_match or mem_match.group(1) != str(memory):
             continue
         item_key = _normalize(item)
         score = SequenceMatcher(None, item_key, model_norm).ratio()
@@ -177,93 +304,24 @@ def find_stock_like(username: str, model_norm: str, memory: str, network: str = 
             best_score = score
             best_item = item
             best_qty = int(qty)
-    if best_item and best_score >= 0.55:  # порог разумный
+    if best_item and best_score >= 0.55:
         return best_item, best_qty
     return None, 0
 
-# ==================
-# --- Продажи
-# ==================
-def add_sale(username: str, model_norm: str, memory: str, qty: int, network: str = "-"):
-    username = username.lstrip("@")
-    net = network if network else "-"
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _lock, _connect() as cx:
-        cx.execute(
-            "INSERT INTO sales(username, model, memory, qty, network, ts) VALUES(?, ?, ?, ?, ?, ?)",
-            (username, model_norm, str(memory), int(qty), net, ts)
-        )
-
-def _month_bounds(year: int, month: int) -> tuple[str, str]:
-    from calendar import monthrange
-    start = f"{year:04d}-{month:02d}-01 00:00:00"
-    last_day = monthrange(year, month)[1]
-    end = f"{year:04d}-{month:02d}-{last_day:02d} 23:59:59"
-    return start, end
-
-def month_sales(year: int, month: int, username: Optional[str] = None) -> tuple[int, Dict[str, int]]:
-    start, end = _month_bounds(year, month)
-    q = "SELECT username, model, memory, SUM(qty) s FROM sales WHERE ts BETWEEN ? AND ?"
-    args = [start, end]
-    if username:
-        q += " AND username=?"
-        args.append(username.lstrip("@"))
-    q += " GROUP BY username, model, memory"
-    total = 0
-    by_model: Dict[str, int] = {}
-    with _lock, _connect() as cx:
-        rows = cx.execute(q, args).fetchall()
-        for r in rows:
-            s = int(r["s"])
-            total += s
-            key = f"{r['model']} {r['memory']}"
-            by_model[key] = by_model.get(key, 0) + s
-    return total, by_model
-
-def get_last_sale_time(username: str) -> Optional[datetime]:
-    username = username.lstrip("@")
-    with _lock, _connect() as cx:
-        r = cx.execute(
-            "SELECT ts FROM sales WHERE username=? ORDER BY ts DESC LIMIT 1",
-            (username,)
-        ).fetchone()
-        if not r:
-            return None
-        # ts сохранён локальным текстом "YYYY-MM-DD HH:MM:SS"
-        try:
-            return datetime.strptime(r["ts"], "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return None
-
-def get_all_known_users() -> List[str]:
-    with _lock, _connect() as cx:
-        r1 = cx.execute("SELECT DISTINCT username FROM stocks").fetchall()
-        r2 = cx.execute("SELECT DISTINCT username FROM sales").fetchall()
-        names = {row["username"] for row in r1} | {row["username"] for row in r2}
-        return sorted(names)
-
-# ===========
-# --- Планы
-# ===========
-def set_plan(username: str, ym: str, plan: int):
-    username = username.lstrip("@")
-    ym = ym[:7]
-    with _lock, _connect() as cx:
-        cx.execute(
-            "INSERT INTO plans(username, ym, plan) VALUES(?, ?, ?) "
-            "ON CONFLICT(username, ym) DO UPDATE SET plan=excluded.plan",
-            (username, ym, int(plan))
-        )
-
-def get_plan(username: str, ym: str) -> Optional[int]:
-    username = username.lstrip("@")
-    ym = ym[:7]
-    with _lock, _connect() as cx:
-        r = cx.execute("SELECT plan FROM plans WHERE username=? AND ym=?", (username, ym)).fetchone()
-        return int(r["plan"]) if r else None
-
-def get_all_plans(ym: str) -> Dict[str, int]:
-    ym = ym[:7]
-    with _lock, _connect() as cx:
-        rows = cx.execute("SELECT username, plan FROM plans WHERE ym=?", (ym,)).fetchall()
-        return {r["username"]: int(r["plan"]) for r in rows}
+# =========================
+# --- ПРОЧЕЕ ---
+# =========================
+def get_all_known_users():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute("""
+            SELECT username FROM sales
+            UNION
+            SELECT username FROM stocks
+            UNION
+            SELECT username FROM plans
+            UNION
+            SELECT username FROM networks
+            UNION
+            SELECT username FROM admins
+        """)
+        return [r[0] for r in cur.fetchall()]
