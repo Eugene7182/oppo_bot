@@ -54,9 +54,17 @@ def is_admin(username: str) -> bool:
 # --------------------------
 # РЕГУЛЯРКИ
 # --------------------------
-SALE_RE = re.compile(r"([a-zа-яё0-9\-\+]+)\s+(\d{2,4}(?:tb|тб)?)\s*[-—: ]?\s*(\d+)?", re.IGNORECASE)
+# Продажи:
+# Поддерживает: Reno14f 256, Reno 14f 256-2, reno14f256, 14f 256, 13F 512-1, A3x 64 — 4
+SALE_RE = re.compile(
+    r"([a-zа-яё0-9\-\+ ]+?)\s*(\d{2,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
+    re.IGNORECASE
+)
+
+# Стоки:
+# Поддерживает: A3x 64 — 4, A5Pro 128-3, Reno 13F 512 — 1, 14f 256-3, 13 512
 STOCK_RE = re.compile(
-    r"([a-zа-яё0-9\+\-\s]+?)\s*(?:\(?\d+\/)?(\d{2,4})(?:тб|tb)?\)?\s*[-—: ]?\s*(\d+)?",
+    r"([a-zа-яё0-9\+\-\s]+?)\s*(\d{2,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
     re.IGNORECASE
 )
 
@@ -264,4 +272,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
