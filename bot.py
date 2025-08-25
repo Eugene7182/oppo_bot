@@ -57,7 +57,6 @@ def parse_yyyymm(s: str | None) -> tuple[int, int]:
     if re.fullmatch(r"\d{4}-\d{2}", s):
         year, month = s.split("-")
         return int(year), int(month)
-    # если прилетело 202508 — тоже поддержим
     if re.fullmatch(r"\d{6}", s):
         return int(s[:4]), int(s[4:])
     raise ValueError("Неверный формат месяца. Жду YYYY-MM, например 2025-08.")
@@ -777,8 +776,14 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
 
-    # Планировщик
-    scheduler = AsyncIOScheduler()
+    # Планировщик (со «страховкой» misfire)
+    scheduler = AsyncIOScheduler(
+        job_defaults={
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": 60 * 60 * 36,  # 36 часов на «догон»
+        }
+    )
     scheduler.add_job(daily_report, "cron", hour=21, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(weekly_projection, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(weekly_stock_reminder, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
