@@ -1,14 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Production bot.py (aiogram v3.7+, webhook, keep-alive, APScheduler)
-Зависимости (requirements.txt):
-aiogram>=3.7
-aiohttp>=3.9
-apscheduler>=3.10
-pytz
-rapidfuzz>=3.6
-SQLAlchemy>=2.0       # если используешь jobstore/sqlalchemy в APS
-python-dateutil       # опционально
 """
 
 import os
@@ -37,8 +29,7 @@ try:
 except Exception:
     HAS_SQLA = False
 
-# Твой модуль работы с БД (мы уже сделали совместимый db.Repo в db.py)
-import db  # ОЖИДАЕМ db.Repo(...)
+import db  # см. db.Repo из твоего db.py
 
 # =============================================================================
 # Конфиг
@@ -47,28 +38,22 @@ import db  # ОЖИДАЕМ db.Repo(...)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
-CRON_KEY = os.getenv("CRON_KEY", "change-me")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "wh_default_0")
+CRON_KEY = os.getenv("CRON_KEY", "cron_default_0")
 
-# Групповой чат для отчётов/напоминаний (публичные сообщения)
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
-
-# Единственный админ (ты)
-ADMIN_TG_ID = int(os.getenv("ADMIN_TG_ID", "0"))  # задай свой Telegram user id
-
-# Таймзона и планировщик
+ADMIN_TG_ID = int(os.getenv("ADMIN_TG_ID", "0"))
 TZ = timezone(os.getenv("TZ", "Asia/Almaty"))
-DATABASE_URL = os.getenv("DATABASE_URL", "")  # если задашь, jobstore будет персистентным
 
-# Keep-alive
+DATABASE_URL = os.getenv("DATABASE_URL", "")  # если укажешь Postgres — jobstore будет персистентным
+
 KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "1") == "1"
 KEEPALIVE_PATH = os.getenv("KEEPALIVE_PATH", "/")
 KEEPALIVE_INTERVAL_MIN = int(os.getenv("KEEPALIVE_INTERVAL_MIN", "4"))
 
-# Поведение по стоку/тише
-SILENT_UNBOUND = os.getenv("SILENT_UNBOUND", "1") == "1"  # если нет привязки сети у автора — молчим
-STRICT_STOCK_PROMPT = True  # просим обновить сток редко и не чаще 1 раза/день/сеть
-RECOVERY_MODE = os.getenv("RECOVERY_MODE", "0") == "1"    # 0 — никого ни о чём не просим (твои привязки живы)
+SILENT_UNBOUND = os.getenv("SILENT_UNBOUND", "1") == "1"
+STRICT_STOCK_PROMPT = True
+RECOVERY_MODE = os.getenv("RECOVERY_MODE", "0") == "1"
 
 # =============================================================================
 # Логирование
@@ -81,7 +66,6 @@ log = logging.getLogger("bot")
 # Помощники и парсинг
 # =============================================================================
 
-# Игнор всего сообщения, если встречается слово:
 IGNORE_WHOLE_MSG_IF_CONTAINS = ("доля",)
 
 SALE_MARKERS = ("продал", "продажа", "прод.", "sale", "шт", "шт.")
@@ -106,7 +90,7 @@ def _norm(s: str) -> str:
     return s
 
 def contains_ignored_word(s: str) -> bool:
-    L = _norm(s)
+    L = _norm(s or "")
     return any(w in L for w in IGNORE_WHOLE_MSG_IF_CONTAINS)
 
 def _strip_prices(s: str) -> str:
@@ -178,16 +162,14 @@ def parse_sale_line(line: str) -> Optional[Dict[str, Any]]:
     if not _looks_like_sale_line(line):
         return None
     qty = _extract_qty(line) or 1
-    mem = _extract_mem(line)  # может быть None
+    mem = _extract_mem(line)
     model_raw = _clean_model_fragment(line)
     if not model_raw or len(model_raw) < 2:
         return None
     return {"model_raw": model_raw, "mem_gb": mem, "qty": qty}
 
 def parse_sales_message(text: str) -> List[Dict[str, Any]]:
-    if not text:
-        return []
-    if contains_ignored_word(text):
+    if not text or contains_ignored_word(text):
         return []
     out: List[Dict[str, Any]] = []
     raw_lines: List[str] = []
@@ -218,8 +200,12 @@ def classify_message(text: str) -> str:
         return "sale"
     return "ignore"
 
+def sanitize_secret(s: str) -> str:
+    s = re.sub(r'[^A-Za-z0-9_-]', '', s or '')
+    return (s or 'wh_default_0').strip()[:256]
+
 # =============================================================================
-# Repo middleware (внедряем repo в хэндлеры)
+# Repo middleware
 # =============================================================================
 
 class RepoMiddleware(BaseMiddleware):
@@ -242,10 +228,6 @@ dp.include_router(router)
 def is_admin(user_id: int) -> bool:
     return ADMIN_TG_ID and user_id == ADMIN_TG_ID
 
-# =============================================================================
-# Вспомогательные отправки с бэкоффом
-# =============================================================================
-
 async def safe_send(chat_id: int, text: str):
     delay = 0.5
     for _ in range(5):
@@ -260,19 +242,13 @@ async def safe_send(chat_id: int, text: str):
             else:
                 log.warning("send failed: %s", e)
                 await asyncio.sleep(delay)
-    # сдаёмся молча
 
 # =============================================================================
-# Хэндлеры сообщений
+# Команды (привязки, планы, проверки)
 # =============================================================================
 
 @router.message(F.text.startswith("сеть:"))
-async def bind_network(m: Message, repo: db.Repo):
-    """
-    Пользователь сам может привязаться:
-    Формат: "сеть: <название>, <город>[, <адрес>]"
-    Для Павлодара адрес обязателен (Только если RECOVERY_MODE=1). Для Аксу/Экибастуза нужен город.
-    """
+async def bind_network_self(m: Message, repo: db.Repo):
     try:
         raw = m.text.split(":", 1)[1].strip()
     except Exception:
@@ -281,16 +257,13 @@ async def bind_network(m: Message, repo: db.Repo):
     name = parts[0] if parts else None
     city = parts[1] if len(parts) > 1 else None
     address = parts[2] if len(parts) > 2 else None
-
     if not name:
         return
     if city is None and any(x in (name or "").lower() for x in ("аксу", "экибастуз", "ekibastuz", "aksu")):
         city = "Аксу" if "аксу" in name.lower() else "Экибастуз"
-
     if RECOVERY_MODE and city and "павлодар" in city.lower() and not address:
         await m.answer("Для Павлодара укажите адрес: сеть: <название>, Павлодар, <адрес>")
         return
-
     await repo.ensure_network(name=name, city=city, address=address)
     await repo.bind_by_tgid(m.from_user.id, name)
     if not SILENT_UNBOUND:
@@ -300,7 +273,6 @@ async def bind_network(m: Message, repo: db.Repo):
 async def cmd_set_network(m: Message, repo: db.Repo):
     if not is_admin(m.from_user.id):
         return
-    # /set_network <@username|tgid> <сеть>
     try:
         _, ident, net = m.text.strip().split(maxsplit=2)
     except Exception:
@@ -321,7 +293,6 @@ async def cmd_set_network(m: Message, repo: db.Repo):
 async def cmd_set_netinfo(m: Message, repo: db.Repo):
     if not is_admin(m.from_user.id):
         return
-    # /set_netinfo <сеть> city=... [address=...]
     text = m.text.strip()
     try:
         _, rest = text.split(" ", 1)
@@ -347,7 +318,6 @@ async def cmd_set_netinfo(m: Message, repo: db.Repo):
 async def cmd_plan(m: Message, repo: db.Repo):
     if not is_admin(m.from_user.id):
         return
-    # /plan <сеть> <число> [город=...] [адрес=...]
     parts = m.text.strip().split()
     if len(parts) < 3:
         await m.answer("Формат: /plan <сеть> <число> [город=...] [адрес=...]")
@@ -373,11 +343,48 @@ async def cmd_plan(m: Message, repo: db.Repo):
     await repo.set_plan(net, y, mth, qty)
     await m.answer(f"План для {net} на {mth:02d}.{y}: {qty}")
 
+@router.message(Command("whoami"))
+async def whoami(m: Message, repo: db.Repo):
+    uname = (m.from_user.username or "").lstrip("@")
+    net = await repo.get_primary_network_for_person(str(m.from_user.id))
+    if not net and uname:
+        if hasattr(repo, "get_network_by_username"):
+            net = await repo.get_network_by_username(uname)
+            if net:
+                await repo.bind_by_tgid(m.from_user.id, net)  # миграция на id
+    await m.answer(
+        "Ваши данные:\n"
+        f"• id: <code>{m.from_user.id}</code>\n"
+        f"• username: @{uname or '-'}\n"
+        f"• сеть: <b>{net or '—'}</b>"
+    )
+
+@router.message(Command("who"))
+async def who(m: Message, repo: db.Repo):
+    if not is_admin(m.from_user.id):
+        return
+    parts = m.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Формат: /who <@username|tgid>")
+        return
+    ident = parts[1].strip()
+    if ident.startswith("@"):
+        uname = ident[1:]
+        net = await repo.get_network_by_username(uname) if hasattr(repo, "get_network_by_username") else None
+        await m.answer(f"@{uname} → сеть: {net or '—'}")
+    else:
+        try:
+            tgid = int(ident)
+        except:
+            await m.answer("tgid должен быть числом")
+            return
+        net = await repo.get_primary_network_for_person(str(tgid))
+        await m.answer(f"id {tgid} → сеть: {net or '—'}")
+
 @router.message(Command("sales"))
 async def cmd_sales(m: Message, repo: db.Repo):
     if not is_admin(m.from_user.id):
         return
-    # /sales [day|week|month] [сеть?]
     parts = m.text.strip().split()
     scope = "day"
     net = None
@@ -401,9 +408,8 @@ async def cmd_sales(m: Message, repo: db.Repo):
         await m.answer(f"{title}: продаж нет")
         return
     lines = [f"📊 {title}:"]
-    for name, qty in data:  # [(network, qty)]
+    for name, qty in data:
         lines.append(f"• {name}: {qty}")
-    # Проекция для месяца
     if scope == "month":
         dom = today_local().day
         days_in_month = calendar.monthrange(today_local().year, today_local().month)[1]
@@ -419,7 +425,6 @@ async def cmd_sales(m: Message, repo: db.Repo):
 async def cmd_stocks(m: Message, repo: db.Repo):
     if not is_admin(m.from_user.id):
         return
-    # /stocks [сеть?]
     parts = m.text.strip().split()
     net = parts[1] if len(parts) >= 2 else None
     rows = await repo.get_stock_table(net)
@@ -427,7 +432,7 @@ async def cmd_stocks(m: Message, repo: db.Repo):
         await m.answer("Нужно обновить сток.")
         return
     lines = ["📦 Текущий сток:"]
-    for name, mem, qty in rows:  # [(canonical, mem, qty)]
+    for name, mem, qty in rows:
         tail = f" {mem}ГБ" if mem else ""
         lines.append(f"• {name}{tail} — {qty}")
     await m.answer("\n".join(lines))
@@ -436,16 +441,19 @@ async def cmd_stocks(m: Message, repo: db.Repo):
 async def cmd_ask_stocks(m: Message):
     if not is_admin(m.from_user.id):
         return
-    # Публичная просьба в общий чат
     if GROUP_CHAT_ID:
         await safe_send(GROUP_CHAT_ID,
             "Коллеги, пришлите, пожалуйста, актуальный сток в формате:\n"
             "сток:\nМодель Память — Количество\nПример:\nReno 11F 5G 128 — 3\nA38 128 — 7\nGalaxy A15 — 5"
         )
 
+# =============================================================================
+# Обработка обычных сообщений
+# =============================================================================
+
 @router.message(F.text)
 async def on_text(m: Message, repo: db.Repo):
-    # Дедуп по update_id (ретраи Телеграма)
+    # антидубль
     if await repo.mark_and_check_update(m.update_id):
         return
 
@@ -453,50 +461,40 @@ async def on_text(m: Message, repo: db.Repo):
     if kind == "ignore":
         return
 
-    # Привязка автора к сети обязательна (мы молчим, если нет)
+    # автор должен быть привязан к сети; миграция по username при необходимости
     person = await repo.get_person_by_tg(m.from_user.id)
-    if not person:
-        if SILENT_UNBOUND:
-            return
-        else:
-            await m.answer("Сделайте привязку: сеть: <название>, <город>[, <адрес>]")
-            return
     network_id = await repo.get_primary_network_for_person(person.id)
+    if not network_id and m.from_user.username:
+        if hasattr(repo, "get_network_by_username"):
+            net_by_un = await repo.get_network_by_username(m.from_user.username)
+            if net_by_un:
+                await repo.bind_by_tgid(m.from_user.id, net_by_un)
+                network_id = net_by_un
+
     if not network_id:
         if SILENT_UNBOUND:
             return
-        else:
-            await m.answer("Сделайте привязку: сеть: <название>, <город>[, <адрес>]")
-            return
+        await m.answer("Сделайте привязку: сеть: <название>, <город>[, <адрес>]")
+        return
 
     net = await repo.get_network(network_id)
 
     if kind == "stock_snapshot":
         await handle_stock_snapshot(m, repo, network_id)
         return
-
     if kind == "stock_inc":
         await handle_stock_inc(m, repo, network_id)
         return
-
     if kind == "sale":
         await handle_sale(m, repo, network_id, net)
         return
 
 # =============================================================================
-# Реализация бизнес-логики
+# Бизнес-логика
 # =============================================================================
 
 async def resolve_product_from_stock_first(repo: db.Repo, network_id: int | str, raw_model: str) -> Tuple[Optional[str], str]:
-    """
-    1) кандидаты из стока сети (порог мягче),
-    2) кандидаты из всего каталога/алиасов (порог строже).
-    repo должен реализовать:
-      - get_network_stock_candidates(network_id) -> List[Tuple[id:str, display:str]]
-      - get_product_candidates_with_aliases() -> List[Tuple[id:str, display:str]]
-    """
     from rapidfuzz import process, fuzz
-
     q = _norm(raw_model)
 
     stock_candidates = await repo.get_network_stock_candidates(network_id)
@@ -525,12 +523,9 @@ async def handle_sale(m: Message, repo: db.Repo, network_id: int | str, net: Any
     for it in items:
         pid, canonical = await resolve_product_from_stock_first(repo, network_id, it["model_raw"])
         if not pid:
-            # строго игнорим нераспознанную модель
             continue
-
         mem = it["mem_gb"] or 0
         qty = it["qty"]
-
         await repo.insert_sale(
             occurred_at=now_local(),
             day=today_local(),
@@ -542,22 +537,14 @@ async def handle_sale(m: Message, repo: db.Repo, network_id: int | str, net: Any
             source_update_id=m.update_id,
         )
         wrote_any = True
-
-        new_qty = await repo.add_stock(network_id, pid, mem, -qty)  # может стать отрицательным
-
-        # Просить обновить: только по делу и не чаще 1р/день/сеть
+        new_qty = await repo.add_stock(network_id, pid, mem, -qty)
         if new_qty < 0:
             if STRICT_STOCK_PROMPT and await repo.prompt_needed_today(network_id, kind="negative"):
                 await safe_send(m.chat.id, "Остаток ушёл в минус, обновите сток.")
-        else:
-            # Если сети ещё не было позиции — не просим до реального минуса (как договорились).
-            pass
-
     if wrote_any:
         await repo.touch_last_sale((await repo.get_person_by_tg(m.from_user.id)).id)
 
 async def handle_stock_inc(m: Message, repo: db.Repo, network_id: int | str):
-    # инкремент построчно
     for line in (l for l in (m.text or "").splitlines() if l.strip()):
         if classify_message(line) != "stock_inc":
             continue
@@ -575,10 +562,8 @@ async def handle_stock_inc(m: Message, repo: db.Repo, network_id: int | str):
             qty=qty,
         )
         await repo.add_stock(network_id, pid, mem or 0, +qty)
-    # никаких просьб «сверить» — ждём явный снапшот
 
 async def handle_stock_snapshot(m: Message, repo: db.Repo, network_id: int | str):
-    # строки после заголовка
     rows: List[Tuple[str, int, int]] = []
     for line in (m.text or "").splitlines()[1:]:
         l = line.strip()
@@ -589,13 +574,10 @@ async def handle_stock_snapshot(m: Message, repo: db.Repo, network_id: int | str
         pid, _ = await resolve_product_from_stock_first(repo, network_id, _clean_model_fragment(l))
         if pid and qty is not None:
             rows.append((pid, mem or 0, qty))
-
-    # атомарная замена стока + помечаем сеть как инициализированную + чистим флаги
     async with repo.tx():
         await repo.replace_stock_snapshot(network_id, rows)
         await repo.set_network_initialized(network_id, True)
         await repo.clear_prompt_flags(network_id)
-
     await safe_send(m.chat.id, "Обновил сток, спасибо.")
 
 # =============================================================================
@@ -632,7 +614,7 @@ async def daily_summary_and_projection(repo: db.Repo):
 async def remind_no_sales_4d(repo: db.Repo):
     if not GROUP_CHAT_ID:
         return
-    groups = await repo.get_stale_people_by_network(days=4)  # {network_name: ['@user1','@user2',...]}
+    groups = await repo.get_stale_people_by_network(days=4)
     if not groups:
         return
     lines = ["Нет продаж 4 дня:"]
@@ -675,11 +657,9 @@ async def keepalive_ping():
         log.debug("keepalive error: %s", e)
 
 async def on_startup(app: web.Application):
-    # Repo из твоего db.py (не ломаем твои данные/привязки)
     app["repo"] = db.Repo()
     dp.message.middleware(RepoMiddleware(app["repo"]))
 
-    # Снести старые хуки и поставить новый — исключает «двух ботов»
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
@@ -689,7 +669,7 @@ async def on_startup(app: web.Application):
         url = f"{RENDER_EXTERNAL_URL}/webhook"
         await bot.set_webhook(
             url=url,
-            secret_token=WEBHOOK_SECRET,
+            secret_token=sanitize_secret(WEBHOOK_SECRET),
             drop_pending_updates=True,
             allowed_updates=["message", "edited_message"]
         )
@@ -727,8 +707,10 @@ async def on_cleanup(app: web.Application):
 
 def build_app() -> web.Application:
     app = web.Application()
+    # health (GET). HEAD прикрутится автоматически.
+    app.router.add_get("/", health)
     app.router.add_post("/cron/daily_report", cron_daily_report)
-    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path="/webhook")
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=sanitize_secret(WEBHOOK_SECRET)).register(app, path="/webhook")
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
@@ -741,6 +723,3 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN environment variable")
     web.run_app(build_app(), port=PORT)
-
-
-
