@@ -516,7 +516,7 @@ async def main():
     # health-check рут
     async def health(request):
         return web.Response(text="OK")
-    app.add_routes([web.get("/", health), web.head("/", health)])
+    app.add_routes([web.get("/", health)])
 
     runner = web.AppRunner(app); await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT); await site.start()
@@ -527,3 +527,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
