@@ -1,3 +1,4 @@
+# bot.py
 import asyncio
 import calendar
 import logging
@@ -56,6 +57,7 @@ def parse_yyyymm(s: str | None) -> tuple[int, int]:
     if re.fullmatch(r"\d{4}-\d{2}", s):
         year, month = s.split("-")
         return int(year), int(month)
+    # если прилетело 202508 — тоже поддержим
     if re.fullmatch(r"\d{6}", s):
         return int(s[:4]), int(s[4:])
     raise ValueError("Неверный формат месяца. Жду YYYY-MM, например 2025-08.")
@@ -83,8 +85,8 @@ def token_is_month(token: str) -> bool:
     return bool(re.fullmatch(r"\d{4}-\d{2}", token) or re.fullmatch(r"\d{6}", token))
 
 def human_network_or_user(u: str) -> str:
-    """Красивое имя: сеть → @username → id"""
-    net = get_network_safe(u)
+    """Красивое имя в ответах: сеть → @username → числовой id"""
+    net = db.get_network(u)
     if net and net != "-":
         return net
     if re.fullmatch(r"\d+", u):
@@ -94,13 +96,18 @@ def human_network_or_user(u: str) -> str:
 def resolve_subject_to_username(arg: str) -> str:
     """
     Принимает «субъект» команд: @username | user_id | network_name.
-    1) Пробуем найти ровно одного по названию сети (db.find_users_by_network).
-    2) Если сеть не нашлась/нашлось несколько — используем как username/id.
+    1) Пробуем найти РОВНО одного пользователя по названию сети (db.find_users_by_network).
+    2) Если сеть не найдена/несколько — используем как username/id.
     """
     tok = (arg or "").strip().lstrip("@")
     if not tok:
         raise ValueError("Не указан пользователь/сеть.")
-    users = find_users_by_network_safe(tok)
+    users = []
+    if hasattr(db, "find_users_by_network"):
+        try:
+            users = db.find_users_by_network(tok) or []
+        except Exception:
+            users = []
     if len(users) == 1:
         return users[0]
     if len(users) > 1:
@@ -108,7 +115,7 @@ def resolve_subject_to_username(arg: str) -> str:
     return tok  # username/id
 
 # -------------------------
-# Обёртки для совместимости с разными db.py
+# Обёртки для совместимости
 # -------------------------
 def list_admins_safe():
     if hasattr(db, "list_admins"):
@@ -139,178 +146,11 @@ def get_last_sale_dt(username: str):
             return None
     return None
 
-def get_network_safe(username: str) -> str:
-    try:
-        return db.get_network(username) or "-"
-    except Exception:
-        return "-"
-
-def get_stocks_safe(username: str | None = None, network: str | None = None):
-    """
-    Пытаемся вызвать db.get_stocks с фильтрами, иначе — без фильтров и фильтруем тут.
-    Ожидаемый формат рядов: (username, item, qty, network, updated_at?) или (username, item, qty, network)
-    Возвращаем нормализованный список: [(username, item, qty, network)]
-    """
-    rows = []
-    try:
-        # новая сигнатура
-        rows = db.get_stocks(username=username, network=network)
-    except TypeError:
-        # старая сигнатура
-        rows = db.get_stocks()
-        # фильтруем вручную
-        flt = []
-        for r in rows:
-            ru = r[0]
-            item = r[1]
-            qty = r[2]
-            net = r[3] if len(r) > 3 else "-"
-            if username and ru != username:
-                continue
-            if network and net != network:
-                continue
-            flt.append((ru, item, qty, net))
-        return flt
-    except Exception:
-        rows = []
-    # нормализуем
-    norm = []
-    for r in rows:
-        ru = r[0]
-        item = r[1]
-        qty = r[2]
-        net = r[3] if len(r) > 3 else "-"
-        norm.append((ru, item, qty, net))
-    return norm
-
-def find_users_by_network_safe(network_name: str):
-    if hasattr(db, "find_users_by_network"):
-        try:
-            return db.find_users_by_network(network_name) or []
-        except Exception:
-            return []
-    return []
-
-def month_sales_safe(year: int, month: int, username: str | None):
-    """
-    Возвращает (total:int, by_model:dict[str,int]).
-    Сначала пробует db.month_sales, иначе — деградация через агрегаты.
-    """
-    if hasattr(db, "month_sales"):
-        try:
-            return db.month_sales(year, month, username=username)
-        except Exception:
-            pass
-
-    # деградация: если есть только get_sales_month() -> берём сумму,
-    # by_model оставить пустым (или попытаться собрать из sales, если есть метод)
-    total = 0
-    by_model = {}
-    if hasattr(db, "get_sales_month"):
-        try:
-            rows = db.get_sales_month()  # [(username, sum_qty, plan?, network)]
-            for r in rows:
-                u, sumq = r[0], int(r[1] or 0)
-                if username is None or u == username:
-                    total += sumq
-            return total, by_model
-        except Exception:
-            pass
-    # как крайний случай — 0, {}
-    return 0, {}
-
-def get_plan_safe(username: str, ym_key: str) -> int:
-    """
-    Пробуем db.get_plan(u, ym_key), если нет — db.get_plan(u)
-    """
-    try:
-        # новая сигнатура
-        return db.get_plan(username, ym_key) or 0
-    except TypeError:
-        try:
-            return db.get_plan(username) or 0
-        except Exception:
-            return 0
-    except Exception:
-        return 0
-
-def set_plan_safe(username: str, ym_key: str, plan_val: int):
-    try:
-        # новая сигнатура
-        db.set_plan(username, ym_key, plan_val)
-        return
-    except TypeError:
-        # старая сигнатура — без YM (перезаписывает текущий месяц)
-        db.set_plan(username, plan_val)
-
-def get_all_known_users_safe():
-    """
-    Если есть db.get_all_known_users — отлично.
-    Иначе собираем уникальных пользователей из sales и stocks.
-    """
-    if hasattr(db, "get_all_known_users"):
-        try:
-            return db.get_all_known_users() or []
-        except Exception:
-            pass
-
-    users = set()
-    # из стоков
-    try:
-        for ru, _, _, _ in get_stocks_safe():
-            users.add(ru)
-    except Exception:
-        pass
-    # из продаж — если есть get_sales_month (агрегировано за всё время)
-    try:
-        if hasattr(db, "get_sales_month"):
-            rows = db.get_sales_month()
-            for r in rows:
-                users.add(r[0])
-    except Exception:
-        pass
-    return sorted(users)
-
-def find_stock_like_safe(username: str, model_norm: str, memory: str, network: str):
-    """
-    Если есть db.find_stock_like — используем.
-    Иначе — простая эвристика поиска по подстроке модели и точной памяти.
-    """
-    if hasattr(db, "find_stock_like"):
-        try:
-            return db.find_stock_like(username, model_norm, memory, network)
-        except Exception:
-            pass
-    # fallback
-    rows = get_stocks_safe(username=username, network=network)
-    # rows: (ru, item, qty, net), item вида "Reno 11F 5G 128"
-    candidates = []
-    for _, item, qty, _ in rows:
-        # memory должно встречаться отдельно (чтобы "128" не совпало с "5128")
-        if re.search(rf"(?:^|\s){re.escape(memory)}(?:\s|$)", item):
-            # нормализуем модель: удаляем пробелы и в нижний
-            item_model_normalized = re.sub(r"\s+", "", item.lower())
-            if model_norm in item_model_normalized:
-                candidates.append((item, int(qty)))
-    if not candidates:
-        return None, 0
-    # берём самый «близкий» — с наибольшей длиной совпадения модели
-    candidates.sort(key=lambda x: (-len(x[0]), x[0]))
-    best_item, best_qty = candidates[0]
-    return best_item, best_qty
-
-def reset_monthly_sales_safe():
-    if hasattr(db, "reset_monthly_sales"):
-        try:
-            db.reset_monthly_sales()
-        except Exception:
-            pass
-
 # ======================
 # --- Определение сети
 # ======================
 def extract_network(username: str, text: str | None) -> str:
-    bind = get_network_safe(username)
+    bind = db.get_network(username)
     if bind and bind != "-":
         return bind
     t = (text or "").lower()
@@ -327,10 +167,7 @@ def is_admin(username: str) -> bool:
         return False
     if username.lstrip("@") in ADMINS_ENV:
         return True
-    try:
-        return db.is_admin(username.lstrip("@"))
-    except Exception:
-        return False
+    return db.is_admin(username.lstrip("@"))
 
 async def admin_guard(message: Message) -> bool:
     if not is_admin(eusername(message)):
@@ -341,17 +178,54 @@ async def admin_guard(message: Message) -> bool:
 # ============================
 # --- Регулярки парсинга ---
 # ============================
-# Парсим «кривые» продажи, типовые записи промоутеров
-SALE_RE = re.compile(
+# 1) «классика» под Reno 11F 5G 128 - 2 и т.п.
+SALE_RE_RENO = re.compile(
     r"((?:reno\s*)?\d{1,2}\s*(?:f)?\s*(?:5\s*g)?)\s*(\d{1,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
     re.IGNORECASE
 )
+# 2) общий случай: «A5 256», «a3x 64», «a17 256-2» и т.п.
+SALE_RE_GENERIC = re.compile(
+    r"([a-zа-яё0-9\+\-]+)\s*(\d{2,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
+    re.IGNORECASE
+)
 
-# Пример строк стока: "Reno 11F 5G 128 - 3"
+# Для обновления стоков строками: "Reno 11F 5G 128 - 3"
 STOCK_RE = re.compile(
     r"([a-zа-яё0-9\+\-\s]+?)\s*(?:\(?\d+\s*/\s*\)?)?\s*(\d{1,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
     re.IGNORECASE
 )
+
+def _find_sales_in_text(text: str) -> list[tuple[str, str, str | None]]:
+    """
+    Пытаемся вытащить продажи. Поддерживаем и «Reno 11F 5G 128 - 2»,
+    и простые строки «A5 256» (много раз подряд).
+    Возвращаем список кортежей (model_raw, memory, qty_raw|None).
+    """
+    results: list[tuple[str, str, str | None]] = []
+
+    # сперва пройтись по строкам — под «список одинаковых»
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("/"):
+            continue
+        m1 = SALE_RE_RENO.findall(line)
+        m2 = SALE_RE_GENERIC.findall(line) if not m1 else []
+        for (model_raw, memory, qty_raw) in (m1 or m2):
+            # отсекаем совсем мусорные «модели» длиной 1 символ
+            if len(re.sub(r"\s+", "", model_raw)) < 2:
+                continue
+            results.append((model_raw, memory, qty_raw))
+
+    # если ничего не нашли по строкам — попробуем по всему тексту
+    if not results:
+        m1 = SALE_RE_RENO.findall(text)
+        m2 = SALE_RE_GENERIC.findall(text) if not m1 else []
+        for (model_raw, memory, qty_raw) in (m1 or m2):
+            if len(re.sub(r"\s+", "", model_raw)) < 2:
+                continue
+            results.append((model_raw, memory, qty_raw))
+
+    return results
 
 # ==================================
 # ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТОВ (без /)
@@ -389,12 +263,12 @@ async def handle_message(message: Message):
             return
 
         # --- ПРОДАЖИ ---
-        matches = SALE_RE.findall(text)
+        matches = _find_sales_in_text(text)
         if not matches:
             return
 
-        # Группируем одинаковые модели без явного количества
-        sales_counter = {}
+        # Группируем одинаковые модели/память и суммируем количество
+        sales_counter: dict[tuple[str, str], int] = {}
         for model_raw, memory, qty_raw in matches:
             model_norm = re.sub(r"\s+", "", model_raw).lower()
             qty = int(qty_raw) if qty_raw else 1
@@ -402,7 +276,10 @@ async def handle_message(message: Message):
             sales_counter[key] = sales_counter.get(key, 0) + qty
 
         # Есть ли у юзера стоки (чтобы уметь списывать)
-        user_stocks = [row for row in get_stocks_safe() if row[0] == user]
+        try:
+            user_stocks = [row for row in db.get_stocks() if row[0] == user]
+        except TypeError:
+            user_stocks = [row for row in db.get_stocks(username=None, network=None) if row[0] == user]
 
         for (model_norm, memory), qty in sales_counter.items():
             # Запись продажи
@@ -410,7 +287,7 @@ async def handle_message(message: Message):
 
             # Стоки
             if user_stocks:
-                stock_item, stock_qty = find_stock_like_safe(user, model_norm, memory, network)
+                stock_item, stock_qty = db.find_stock_like(user, model_norm, memory, network)
                 if stock_item is None:
                     await message.reply(
                         f"⚠️ Остаток для {model_norm} {memory} не найден. {human_network_or_user(user)}, обновите сток!"
@@ -423,7 +300,7 @@ async def handle_message(message: Message):
                     db.decrease_stock(user, stock_item, qty, network)
 
         if user_stocks:
-            await message.reply(f"✅ Продажи учтены. Сеть: {network if network!='-' else '—'}")
+            await message.reply(f"✅ Продажи учтены. Сеть: {network if network != '-' else '—'}")
 
     except Exception as e:
         logging.exception("handle_message error")
@@ -443,6 +320,7 @@ async def cmd_help(message: Message):
         bold("Команды:"),
         "/help — это меню",
         "/stocks [@user|user_id|network] [network_filter] — показать стоки",
+        "/stocks all [network] — показать стоки всех (админ)",
         "/sales_month [YYYY-MM] [@user|user_id|network] — продажи за месяц",
         "/set_network @user|user_id network или '-' — привязать или убрать сеть",
         "/set_sales @user|user_id|network model memory qty [network] — добавить продажу",
@@ -498,15 +376,57 @@ async def cmd_set_network(message: Message):
     network = parts[-1]
     u = subj.lstrip("@")
     db.set_network(u, "-" if network == "-" else network)
-    await message.reply(f"🔗 {human_network_or_user(u)} → сеть: {network if network!='-' else '—'}")
+    await message.reply(f"🔗 {human_network_or_user(u)} → сеть: {network if network != '-' else '—'}")
 
 @router.message(Command("stocks"))
 async def cmd_stocks(message: Message):
-    # /stocks [@user|user_id|network] [network_filter]
+    """
+    /stocks                           -> (обычный) свои, (админ) свои
+    /stocks @user|user_id|network     -> стоки конкретного промоутера/по сети
+    /stocks all [network]             -> стоки всех (только админ), можно отфильтровать по сети
+    """
     parts = (message.text or "").split()
     args = parts[1:]
 
     viewer = eusername(message)
+
+    # ---- Режим "all"
+    if args and args[0].lower() == "all":
+        if not is_admin(viewer):
+            await message.reply("⛔ Только для админов.")
+            return
+
+        net = None
+        if len(args) >= 2 and args[1] != "-":
+            net = args[1]
+
+        try:
+            all_rows = db.get_stocks()
+        except TypeError:
+            all_rows = db.get_stocks(username=None, network=None)
+
+        if net is not None:
+            all_rows = [r for r in all_rows if (len(r) >= 4 and (r[3] or "-") == net)]
+
+        if not all_rows:
+            await message.reply(f"📦 Стоков нет. Фильтр сеть: {net or '—'}")
+            return
+
+        # Группировка по пользователю
+        by_user: dict[str, list[tuple[str, int, str]]] = {}
+        for username, item, qty, network in all_rows:
+            by_user.setdefault(username, []).append((item, qty, network))
+
+        lines = [bold(f"📦 Стоки ВСЕХ (сеть: {net or 'все'})")]
+        for username in sorted(by_user):
+            lines.append(bold(f"{human_network_or_user(username)}"))
+            for item, qty, nw in sorted(by_user[username], key=lambda x: x[0].lower()):
+                suffix = f" ({nw})" if net is None and nw else ""
+                lines.append(f"• {item} — {qty}{suffix}")
+        await message.reply("\n".join(lines))
+        return
+
+    # ---- Обычный режим
     target = viewer
     net = None
 
@@ -515,28 +435,29 @@ async def cmd_stocks(message: Message):
         try:
             target = resolve_subject_to_username(subj)
         except ValueError:
-            # Если это не сеть и не @user/ID — трактуем как фильтр сети
+            # Неуникальная сеть/не сеть — считаем это сетевым фильтром
             net = subj if subj != "-" else None
-        if len(args) >= 2 and net is None:
-            net = args[1] if args[1] != "-" else None
+        if len(args) >= 2 and net is None and args[1] != "-":
+            net = args[1]
 
     if target != viewer and not is_admin(viewer):
         await message.reply("⛔ Можно смотреть только свои стоки (или быть админом).")
         return
 
-    rows = get_stocks_safe(username=target, network=net)
+    rows = db.get_stocks(username=target, network=net)
     if not rows:
-        await message.reply(f"📦 Стоков нет. {human_network_or_user(target)} сеть: {net or get_network_safe(target)}")
+        cur_net = net or db.get_network(target) or "—"
+        await message.reply(f"📦 Стоков нет. {human_network_or_user(target)} сеть: {cur_net}")
         return
 
-    lines = [bold(f"📦 Стоки {human_network_or_user(target)} (сеть: {net or get_network_safe(target)})")]
-    for _, item, qty, network in rows:
+    header_net = net or db.get_network(target) or "—"
+    lines = [bold(f"📦 Стоки {human_network_or_user(target)} (сеть: {header_net})")]
+    for _, item, qty, _nw in rows:
         lines.append(f"{item} — {qty}")
     await message.reply("\n".join(lines))
 
 @router.message(Command("sales_month"))
 async def cmd_sales_month(message: Message):
-    # /sales_month [YYYY-MM] [@user|user_id|network]
     parts = (message.text or "").split()
     args = parts[1:]
 
@@ -564,8 +485,8 @@ async def cmd_sales_month(message: Message):
         await message.reply("⛔ Можно смотреть только свои продажи (или быть админом).")
         return
 
-    total, by_model = month_sales_safe(year, month, username=target)
-    plan = get_plan_safe(target, f"{year:04d}-{month:02d}") or 0
+    total, by_model = db.month_sales(year, month, username=target)
+    plan = db.get_plan(target, f"{year:04d}-{month:02d}") or 0
     k = pct(total, plan) if plan else "—"
 
     hdr = bold(f"📈 Продажи {human_network_or_user(target)} за {year:04d}-{month:02d}") + \
@@ -603,7 +524,7 @@ async def cmd_set_sales(message: Message):
         model = re.sub(r"\s+", "", rest[0]).lower()
         memory = str(int(rest[1]))
         qty = int(rest[2])
-        net = rest[3] if len(rest) >= 4 else get_network_safe(u) or "-"
+        net = rest[3] if len(rest) >= 4 else db.get_network(u) or "-"
         db.add_sale(u, model, memory, qty, net)
         await message.reply(f"✅ Добавлено: {human_network_or_user(u)} {model} {memory} x{qty} (сеть: {net})")
     except Exception as e:
@@ -633,9 +554,9 @@ async def cmd_set_plan(message: Message):
     ym_key = f"{y:04d}-{m:02d}"
 
     if target_all:
-        users = get_all_known_users_safe()
+        users = db.get_all_known_users()
         for u in users:
-            set_plan_safe(u, ym_key, plan_val)
+            db.set_plan(u, ym_key, plan_val)
         await message.reply(f"✅ План {plan_val} проставлен всем на {ym_key}.")
         return
 
@@ -645,7 +566,7 @@ async def cmd_set_plan(message: Message):
         await message.reply(f"⚠️ {e}")
         return
 
-    set_plan_safe(tgt_user, ym_key, plan_val)
+    db.set_plan(tgt_user, ym_key, plan_val)
     await message.reply(f"✅ План {human_network_or_user(tgt_user)}: {plan_val} на {ym_key}")
 
 @router.message(Command("plan_show"))
@@ -659,20 +580,13 @@ async def cmd_plan_show(message: Message):
             break
     y, m = parse_yyyymm(ym)
     ym_key = f"{y:04d}-{m:02d}"
-    plans = {}
-    try:
-        if hasattr(db, "get_all_plans"):
-            plans = db.get_all_plans(ym_key) or {}
-    except Exception:
-        plans = {}
-
+    plans = db.get_all_plans(ym_key)
     if not plans:
         await message.reply(f"Планы на {ym_key} не заданы.")
         return
-
     lines = [bold(f"📋 Планы на {ym_key}")]
     for u, p in sorted(plans.items()):
-        total, _ = month_sales_safe(y, m, username=u)
+        total, _ = db.month_sales(y, m, username=u)
         lines.append(f"{human_network_or_user(u)}: план {p} | факт {total} | {pct(total, p)}")
     await message.reply("\n".join(lines))
 
@@ -712,14 +626,11 @@ async def cmd_set_fact(message: Message):
 
     y, m = parse_yyyymm(ym_token)
     ym_key = f"{y:04d}-{m:02d}"
-    net = get_network_safe(u) or "-"
+    net = db.get_network(u) or "-"
 
     try:
-        if hasattr(db, "set_monthly_fact"):
-            db.set_monthly_fact(u, ym_key, int(qty_token), net)
-            await message.reply(f"✅ Факт для {human_network_or_user(u)} установлен: {qty_token} за {ym_key}.")
-        else:
-            await message.reply("⚠️ В db.py отсутствует set_monthly_fact.")
+        db.set_monthly_fact(u, ym_key, int(qty_token), net)
+        await message.reply(f"✅ Факт для {human_network_or_user(u)} установлен: {qty_token} за {ym_key}.")
     except Exception as e:
         await message.reply(f"⚠️ Ошибка: {e}")
 
@@ -759,14 +670,11 @@ async def cmd_add_fact(message: Message):
 
     y, m = parse_yyyymm(ym_token)
     ym_key = f"{y:04d}-{m:02d}"
-    net = get_network_safe(u) or "-"
+    net = db.get_network(u) or "-"
 
     try:
-        if hasattr(db, "add_monthly_fact"):
-            db.add_monthly_fact(u, ym_key, int(qty_token), net)
-            await message.reply(f"➕ Добавлено к факту {human_network_or_user(u)}: +{qty_token} за {ym_key}.")
-        else:
-            await message.reply("⚠️ В db.py отсутствует add_monthly_fact.")
+        db.add_monthly_fact(u, ym_key, int(qty_token), net)
+        await message.reply(f"➕ Добавлено к факту {human_network_or_user(u)}: +{qty_token} за {ym_key}.")
     except Exception as e:
         await message.reply(f"⚠️ Ошибка: {e}")
 
@@ -780,18 +688,18 @@ async def daily_report():
     day = d.day
     ym_key = f"{y:04d}-{m:02d}"
 
-    users = get_all_known_users_safe()
+    users = db.get_all_known_users()
     if not users:
         return
 
     lines = [bold(f"🗓️ Ежедневный отчёт {ym_key} (на {d.strftime('%d.%m %H:%M')})")]
     for u in sorted(users):
-        fact, _ = month_sales_safe(y, m, username=u)
-        plan = get_plan_safe(u, ym_key) or 0
+        fact, _ = db.month_sales(y, m, username=u)
+        plan = db.get_plan(u, ym_key) or 0
         pr = pct(fact, plan) if plan else "—"
         pace = (fact / day) if day > 0 else 0
         proj = round(pace * days_in_month)
-        lines.append(f"{human_network_or_user(u)}: факт {fact} / план {plan} ({pr}), проекция {proj})")
+        lines.append(f"{human_network_or_user(u)}: факт {fact} / план {plan} ({pr}), проекция {proj}")
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
 async def weekly_projection():
@@ -801,21 +709,21 @@ async def weekly_projection():
     day = d.day
     ym_key = f"{y:04d}-{m:02d}"
 
-    users = get_all_known_users_safe()
+    users = db.get_all_known_users()
     if not users:
         return
 
     lines = [bold(f"📈 Недельная проекция {ym_key}")]
     for u in sorted(users):
-        fact, _ = month_sales_safe(y, m, username=u)
-        plan = get_plan_safe(u, ym_key) or 0
+        fact, _ = db.month_sales(y, m, username=u)
+        plan = db.get_plan(u, ym_key) or 0
         pace = (fact / day) if day > 0 else 0
         proj = round(pace * days_in_month)
         lines.append(f"{human_network_or_user(u)}: факт {fact}, план {plan}, проекция {proj}")
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
 async def weekly_stock_reminder():
-    users = get_all_known_users_safe()
+    users = db.get_all_known_users()
     if not users:
         return
     mentions = " ".join(human_network_or_user(u) for u in users)
@@ -827,7 +735,7 @@ async def monthly_report():
     d = now_ala()
     y, m = d.year, d.month
     ym_key = f"{y:04d}-{m:02d}"
-    users = get_all_known_users_safe()
+    users = db.get_all_known_users()
     if not users:
         return
 
@@ -835,8 +743,8 @@ async def monthly_report():
     total_all = 0
     plan_all = 0
     for u in sorted(users):
-        fact, _ = month_sales_safe(y, m, username=u)
-        plan = get_plan_safe(u, ym_key) or 0
+        fact, _ = db.month_sales(y, m, username=u)
+        plan = db.get_plan(u, ym_key) or 0
         total_all += fact
         plan_all += plan
         lines.append(f"{human_network_or_user(u)}: {fact} / {plan} ({pct(fact, plan)})")
@@ -844,8 +752,9 @@ async def monthly_report():
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
 async def inactive_promoters_reminder():
+    # Пинать тех, у кого нет продаж последние 2 дня
     cutoff = now_ala() - timedelta(days=2)
-    users = get_all_known_users_safe()
+    users = db.get_all_known_users()
     lazy = []
     for u in users:
         last = get_last_sale_dt(u)
@@ -861,13 +770,8 @@ async def inactive_promoters_reminder():
 #   MAIN
 # =========
 async def main():
-    # Инициализация БД
-    try:
-        db.init()
-    except Exception:
-        # на случай старого имени функции
-        if hasattr(db, "init_db"):
-            db.init_db()
+    # Гарантируем, что БД подготовлена
+    db.init()
 
     # Вебхук
     await bot.delete_webhook(drop_pending_updates=True)
@@ -880,14 +784,16 @@ async def main():
     scheduler.add_job(weekly_stock_reminder, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(inactive_promoters_reminder, "cron", hour=20, minute=30, timezone="Asia/Almaty")
-    # Автосброс продаж в начале месяца (если функция есть)
-    scheduler.add_job(reset_monthly_sales_safe, "cron", day=1, hour=0, minute=5, timezone="Asia/Almaty")
+    # Автосброс продаж в начале месяца
+    if hasattr(db, "reset_monthly_sales"):
+        scheduler.add_job(db.reset_monthly_sales, "cron", day=1, hour=0, minute=5, timezone="Asia/Almaty")
     scheduler.start()
 
     # AIOHTTP
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
 
+    # health-check рут
     async def health(request):
         return web.Response(text="OK")
     app.add_routes([web.get("/", health)])
