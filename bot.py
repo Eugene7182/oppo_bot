@@ -721,8 +721,6 @@ async def on_cleanup(app: web.Application):
 
 def build_app() -> web.Application:
     app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_head("/", health)
     app.router.add_post("/cron/daily_report", cron_daily_report)
     SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path="/webhook")
     app.on_startup.append(on_startup)
@@ -737,3 +735,4 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN environment variable")
     web.run_app(build_app(), port=PORT)
+
