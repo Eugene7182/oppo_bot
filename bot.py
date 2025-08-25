@@ -219,34 +219,38 @@ async def handle_message(message: Message):
             return
 
         # --- ПРОДАЖИ ---
-        matches = SALE_RE.findall(text)
-        if not matches:
-            return
+matches = SALE_RE.findall(text)
+if not matches:
+    return
 
-        # Есть ли у юзера стоки (чтобы уметь списывать)
-        user_stocks = [row for row in db.get_stocks() if row[0] == user]
+# Группируем одинаковые модели без явного количества
+sales_counter = {}
+for model_raw, memory, qty_raw in matches:
+    model_norm = re.sub(r"\s+", "", model_raw).lower()
+    qty = int(qty_raw) if qty_raw else 1
+    key = (model_norm, str(memory))
+    sales_counter[key] = sales_counter.get(key, 0) + qty
 
-        for model_raw, memory, qty_raw in matches:
-            model_norm = re.sub(r"\s+", "", model_raw).lower()
-            qty = int(qty_raw) if qty_raw else 1
+# Есть ли у юзера стоки (чтобы уметь списывать)
+user_stocks = [row for row in db.get_stocks() if row[0] == user]
 
-            # Запись продажи
-            db.add_sale(user, model_norm, str(memory), qty, network)
+for (model_norm, memory), qty in sales_counter.items():
+    # Запись продажи
+    db.add_sale(user, model_norm, memory, qty, network)
 
-            # Стоки
-            if not user_stocks:
-                continue
+    # Стоки
+    if user_stocks:
+        stock_item, stock_qty = db.find_stock_like(user, model_norm, memory, network)
+        if stock_item is None:
+            await message.reply(f"⚠️ Остаток для {model_norm} {memory} не найден. {human_network_or_user(user)}, обновите сток!")
+        elif stock_qty < qty:
+            await message.reply(f"⚠️ У {human_network_or_user(user)} не хватает стока для {stock_item} (продажа {qty}, остаток {stock_qty}).")
+        else:
+            db.decrease_stock(user, stock_item, qty, network)
 
-            stock_item, stock_qty = db.find_stock_like(user, model_norm, str(memory), network)
-            if stock_item is None:
-                await message.reply(f"⚠️ Остаток для {model_norm} {memory} не найден. {human_network_or_user(user)}, обновите сток!")
-            elif stock_qty < qty:
-                await message.reply(f"⚠️ У {human_network_or_user(user)} не хватает стока для {stock_item} (продажа {qty}, остаток {stock_qty}).")
-            else:
-                db.decrease_stock(user, stock_item, qty, network)
+if user_stocks:
+    await message.reply(f"✅ Продажи учтены. Сеть: {network if network!='-' else '—'}")
 
-        if user_stocks:
-            await message.reply(f"✅ Продажи учтены. Сеть: {network if network!='-' else '—'}")
 
     except Exception as e:
         logging.exception("handle_message error")
@@ -702,3 +706,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
