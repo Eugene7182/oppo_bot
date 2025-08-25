@@ -82,6 +82,41 @@ def extract_mentioned_username(text: str) -> str | None:
 def human_network(net: str) -> str:
     return net if net and net != "-" else "—"
 
+# -------------------------
+# Обёртки для совместимости
+# -------------------------
+def list_admins_safe():
+    """Поддержка и db.list_admins(), и db.get_admins()."""
+    if hasattr(db, "list_admins"):
+        try:
+            return db.list_admins()
+        except Exception:
+            pass
+    if hasattr(db, "get_admins"):
+        try:
+            return db.get_admins()
+        except Exception:
+            pass
+    return []
+
+def get_last_sale_dt(username: str):
+    """Поддержка и db.get_last_sale_time(), и db.get_last_sale()."""
+    if hasattr(db, "get_last_sale_time"):
+        try:
+            return db.get_last_sale_time(username)
+        except Exception:
+            return None
+    if hasattr(db, "get_last_sale"):
+        try:
+            s = db.get_last_sale(username)
+            if not s:
+                return None
+            # ожидаем YYYY-MM-DD
+            return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=tz)
+        except Exception:
+            return None
+    return None
+
 # ======================
 # --- Определение сети
 # ======================
@@ -210,9 +245,9 @@ async def cmd_help(message: Message):
         "/help — это меню",
         "/stocks [@user] [network] — показать стоки (по умолчанию твои)",
         "/sales_month [YYYY-MM] [@user] — продажи за месяц",
-        "/set_network @user <network|-> — привязать сеть пользователю",
-        "/set_sales @user <model> <memory> <qty> [network] — добавить продажу",
-        "/set_plan <@user|all> <PLAN> [YYYY-MM] — задать план",
+        "/set_network @user network или '-' — привязать сеть пользователю",
+        "/set_sales @user model memory qty [network] — добавить продажу",
+        "/set_plan @user|all PLAN [YYYY-MM] — задать план",
         "/plan_show [YYYY-MM] — показать планы",
         "/admins_show — список админов",
         "/admin_add @user — выдать админа",
@@ -225,7 +260,7 @@ async def cmd_admins_show(message: Message):
     if not await admin_guard(message):
         return
     env = ", ".join(f"@{u}" for u in ADMINS_ENV) if ADMINS_ENV else "—"
-    dbs = ", ".join(f"@{u}" for u in db.list_admins()) or "—"
+    dbs = ", ".join(f"@{u}" for u in list_admins_safe()) or "—"
     await message.reply(f"👮 ENV: {env}\n👮 DB: {dbs}")
 
 @router.message(Command("admin_add"))
@@ -237,7 +272,7 @@ async def cmd_admin_add(message: Message):
         await message.reply("Формат: /admin_add @user")
         return
     db.add_admin(u)
-    await message.reply(f"✅ @${u} теперь админ.")
+    await message.reply(f"✅ @{u} теперь админ.")
 
 @router.message(Command("admin_remove"))
 async def cmd_admin_remove(message: Message):
@@ -257,11 +292,11 @@ async def cmd_set_network(message: Message):
     parts = message.text.split()
     u = extract_mentioned_username(message.text)
     if not u or len(parts) < 3:
-        await message.reply("Формат: /set_network @user <network|->")
+        await message.reply("Формат: /set_network @user network или '-'")
         return
     network = parts[-1]
     if network == "@"+u:  # если слиплось
-        await message.reply("Формат: /set_network @user <network|->")
+        await message.reply("Формат: /set_network @user network или '-'")
         return
     db.set_network(u, "-" if network == "-" else network)
     await message.reply(f"🔗 @{u} → сеть: {human_network(network)}")
@@ -291,7 +326,7 @@ async def cmd_stocks(message: Message):
         lines.append(f"{item} — {qty}")
     await message.reply("\n".join(lines))
 
-@router.message(Command("sales_month"))
+@router.message(Command("sales_month")))
 async def cmd_sales_month(message: Message):
     # /sales_month [YYYY-MM] [@user]
     txt = (message.text or "").strip()
@@ -321,18 +356,18 @@ async def cmd_sales_month(message: Message):
 async def cmd_set_sales(message: Message):
     if not await admin_guard(message):
         return
-    # /set_sales @user <model> <memory> <qty> [network]
+    # /set_sales @user model memory qty [network]
     # Пример: /set_sales @vasya reno11f5g 128 2 Mechta
     parts = (message.text or "").split()
     u = extract_mentioned_username(message.text)
     if not u:
-        await message.reply("Формат: /set_sales @user <model> <memory> <qty> [network]")
+        await message.reply("Формат: /set_sales @user model memory qty [network]")
         return
     try:
         # убираем имя и команду
         rest = [p for p in parts if not p.startswith("/") and not p.startswith("@")]
         if len(rest) < 3:
-            await message.reply("Формат: /set_sales @user <model> <memory> <qty> [network]")
+            await message.reply("Формат: /set_sales @user model memory qty [network]")
             return
         model = re.sub(r"\s+", "", rest[0]).lower()
         memory = str(int(rest[1]))
@@ -347,10 +382,10 @@ async def cmd_set_sales(message: Message):
 async def cmd_set_plan(message: Message):
     if not await admin_guard(message):
         return
-    # /set_plan <@user|all> <PLAN> [YYYY-MM]
+    # /set_plan @user|all PLAN [YYYY-MM]
     parts = (message.text or "").split()
     if len(parts) < 3:
-        await message.reply("Формат: /set_plan <@user|all> <PLAN> [YYYY-MM]")
+        await message.reply("Формат: /set_plan @user|all PLAN [YYYY-MM]")
         return
     tgt_user = extract_mentioned_username(message.text)
     target_all = (parts[1].lower() == "all")
@@ -480,7 +515,7 @@ async def inactive_promoters_reminder():
     users = db.get_all_known_users()
     lazy = []
     for u in users:
-        last = db.get_last_sale_time(u)
+        last = get_last_sale_dt(u)
         if last is None or last < cutoff:
             lazy.append(u)
     if not lazy:
@@ -513,7 +548,7 @@ async def main():
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
 
-    # health-check рут
+    # health-check рут (только GET — без HEAD, чтобы не падало на дубль)
     async def health(request):
         return web.Response(text="OK")
     app.add_routes([web.get("/", health)])
@@ -527,4 +562,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
