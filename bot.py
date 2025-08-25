@@ -72,20 +72,40 @@ def code(s: str) -> str:
     return f"<code>{s}</code>"
 
 def eusername(message: Message) -> str:
+    # Возвращаем ключ пользователя: @username без @ или числовой id
     return (message.from_user.username or str(message.from_user.id)).lstrip("@")
 
 def extract_mentioned_username(text: str) -> str | None:
     m = re.search(r"@([A-Za-z0-9_]+)", text or "")
     return m.group(1) if m else None
 
+def token_is_month(token: str) -> bool:
+    return bool(re.fullmatch(r"\d{4}-\d{2}", token) or re.fullmatch(r"\d{6}", token))
+
 def human_network_or_user(u: str) -> str:
-    """Красивое имя: сеть → username → id"""
+    """Красивое имя: сеть → @username → id"""
     net = db.get_network(u)
     if net and net != "-":
         return net
-    if re.fullmatch(r"\d+", u):  # это id
+    if re.fullmatch(r"\d+", u):
         return u
     return f"@{u}"
+
+def resolve_subject_to_username(arg: str) -> str:
+    """
+    Принимает «субъект» команд: @username | user_id | network_name.
+    1) Пробуем найти ровно одного по названию сети.
+    2) Если сеть не нашлась/нашлось несколько — используем как username/id.
+    """
+    tok = (arg or "").strip().lstrip("@")
+    if not tok:
+        raise ValueError("Не указан пользователь/сеть.")
+    users = db.find_users_by_network(tok)
+    if len(users) == 1:
+        return users[0]
+    if len(users) > 1:
+        raise ValueError(f"Сеть '{tok}' привязана к нескольким пользователям: {', '.join('@'+u for u in users)}. Уточни.")
+    return tok  # username/id
 
 # -------------------------
 # Обёртки для совместимости
@@ -151,14 +171,18 @@ async def admin_guard(message: Message) -> bool:
 # ============================
 # --- Регулярки парсинга ---
 # ============================
+# Парсим «кривые» продажи, типовые записи промоутеров
 SALE_RE = re.compile(
     r"((?:reno\s*)?\d{1,2}\s*(?:f)?\s*(?:5\s*g)?)\s*(\d{1,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
     re.IGNORECASE
 )
+
+# Пример строк стока: "Reno 11F 5G 128 - 3"
 STOCK_RE = re.compile(
     r"([a-zа-яё0-9\+\-\s]+?)\s*(?:\(?\d+\s*/\s*\)?)?\s*(\d{1,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
     re.IGNORECASE
 )
+
 # ==================================
 # ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТОВ (без /)
 # ==================================
@@ -190,7 +214,8 @@ async def handle_message(message: Message):
                 db.update_stock(user, item_name, qty, network)
                 updated.append(f"{item_name} = {qty}")
             if updated:
-                await message.reply("📦 Обновлено:\n" + "\n".join(updated) + f"\nСеть: {network if network!='-' else '—'}")
+                net_h = network if network != "-" else "—"
+                await message.reply("📦 Обновлено:\n" + "\n".join(updated) + f"\nСеть: {net_h}")
             return
 
         # --- ПРОДАЖИ ---
@@ -198,14 +223,17 @@ async def handle_message(message: Message):
         if not matches:
             return
 
+        # Есть ли у юзера стоки (чтобы уметь списывать)
         user_stocks = [row for row in db.get_stocks() if row[0] == user]
 
         for model_raw, memory, qty_raw in matches:
             model_norm = re.sub(r"\s+", "", model_raw).lower()
             qty = int(qty_raw) if qty_raw else 1
 
+            # Запись продажи
             db.add_sale(user, model_norm, str(memory), qty, network)
 
+            # Стоки
             if not user_stocks:
                 continue
 
@@ -238,11 +266,13 @@ async def cmd_help(message: Message):
     txt = [
         bold("Команды:"),
         "/help — это меню",
-        "/stocks [@user] [network] — показать стоки",
-        "/sales_month [YYYY-MM] [@user] — продажи за месяц",
-        "/set_network @user network или '-' — привязать сеть пользователю",
-        "/set_sales @user model memory qty [network] — добавить продажу",
-        "/set_plan @user|all PLAN [YYYY-MM] — задать план",
+        "/stocks [@user|user_id|network] [network_filter] — показать стоки",
+        "/sales_month [YYYY-MM] [@user|user_id|network] — продажи за месяц",
+        "/set_network @user|user_id network или '-' — привязать или убрать сеть",
+        "/set_sales @user|user_id|network model memory qty [network] — добавить продажу",
+        "/set_plan @user|user_id|network|all PLAN [YYYY-MM] — задать план",
+        "/set_fact @user|user_id|network QTY [YYYY-MM] — ЖЁСТКО задать факт месяца",
+        "/add_fact @user|user_id|network QTY [YYYY-MM] — ДОБАВИТЬ к факту месяца",
         "/plan_show [YYYY-MM] — показать планы",
         "/admins_show — список админов",
         "/admin_add @user — выдать админа",
@@ -250,7 +280,7 @@ async def cmd_help(message: Message):
     ]
     await message.reply("\n".join(txt))
 
-@router.message(Command("admins_show"))
+@router.message(Command("admins_show")))
 async def cmd_admins_show(message: Message):
     if not await admin_guard(message):
         return
@@ -258,7 +288,7 @@ async def cmd_admins_show(message: Message):
     dbs = ", ".join(f"@{u}" for u in list_admins_safe()) or "—"
     await message.reply(f"👮 ENV: {env}\n👮 DB: {dbs}")
 
-@router.message(Command("admin_add"))
+@router.message(Command("admin_add")))
 async def cmd_admin_add(message: Message):
     if not await admin_guard(message):
         return
@@ -269,7 +299,7 @@ async def cmd_admin_add(message: Message):
     db.add_admin(u)
     await message.reply(f"✅ @{u} теперь админ.")
 
-@router.message(Command("admin_remove"))
+@router.message(Command("admin_remove")))
 async def cmd_admin_remove(message: Message):
     if not await admin_guard(message):
         return
@@ -280,34 +310,40 @@ async def cmd_admin_remove(message: Message):
     db.remove_admin(u)
     await message.reply(f"🗑️ @{u} удалён из админов.")
 
-@router.message(Command("set_network"))
+@router.message(Command("set_network")))
 async def cmd_set_network(message: Message):
     if not await admin_guard(message):
         return
-    parts = message.text.split()
-    u = extract_mentioned_username(message.text) or (parts[1] if len(parts) > 1 else None)
-    if not u or len(parts) < 3:
-        await message.reply("Формат: /set_network @user network или '-'")
+    parts = (message.text or "").split()
+    if len(parts) < 3:
+        await message.reply("Формат: /set_network @user|user_id network или '-'")
         return
+    subj = parts[1]
     network = parts[-1]
-    if network == "@" + u:
-        await message.reply("Формат: /set_network @user network или '-'")
-        return
+    u = subj.lstrip("@")  # для set_network можно указать и сеть позже
     db.set_network(u, "-" if network == "-" else network)
     await message.reply(f"🔗 {human_network_or_user(u)} → сеть: {network if network!='-' else '—'}")
-@router.message(Command("stocks"))
+
+@router.message(Command("stocks")))
 async def cmd_stocks(message: Message):
-    # /stocks [@user] [network]
+    # /stocks [@user|user_id|network] [network_filter]
     parts = (message.text or "").split()
-    u = extract_mentioned_username(message.text)
-    net = None
-    if len(parts) >= 2 and not u:
-        net = parts[1] if parts[1] != "-" else None
-    if len(parts) >= 3 and u:
-        net = parts[2] if parts[2] != "-" else None
+    args = parts[1:]
 
     viewer = eusername(message)
-    target = u or viewer
+    target = viewer
+    net = None
+
+    if args:
+        subj = args[0]
+        try:
+            target = resolve_subject_to_username(subj)
+        except ValueError:
+            # Если это не сеть и не @user/ID — трактуем как фильтр сети
+            net = subj if subj != "-" else None
+        if len(args) >= 2 and net is None:
+            net = args[1] if args[1] != "-" else None
+
     if target != viewer and not is_admin(viewer):
         await message.reply("⛔ Можно смотреть только свои стоки (или быть админом).")
         return
@@ -322,20 +358,30 @@ async def cmd_stocks(message: Message):
         lines.append(f"{item} — {qty}")
     await message.reply("\n".join(lines))
 
-
-@router.message(Command("sales_month"))
+@router.message(Command("sales_month")))
 async def cmd_sales_month(message: Message):
-    txt = (message.text or "").strip()
-    u = extract_mentioned_username(txt)
+    parts = (message.text or "").split()
+    args = parts[1:]
+
+    viewer = eusername(message)
+    target = viewer
     arg_month = None
-    for token in txt.split():
-        if re.fullmatch(r"\d{4}-\d{2}", token) or re.fullmatch(r"\d{6}", token):
-            arg_month = token
-            break
+    subj = None
+
+    for t in args:
+        if token_is_month(t) and arg_month is None:
+            arg_month = t
+        elif subj is None:
+            subj = t
+
+    if subj:
+        try:
+            target = resolve_subject_to_username(subj)
+        except ValueError as e:
+            await message.reply(f"⚠️ {e}")
+            return
 
     year, month = parse_yyyymm(arg_month)
-    viewer = eusername(message)
-    target = u or viewer
 
     if target != viewer and not is_admin(viewer):
         await message.reply("⛔ Можно смотреть только свои продажи (или быть админом).")
@@ -345,29 +391,38 @@ async def cmd_sales_month(message: Message):
     plan = db.get_plan(target, f"{year:04d}-{month:02d}") or 0
     k = pct(total, plan) if plan else "—"
 
-    hdr = bold(f"📈 Продажи {human_network_or_user(target)} за {year:04d}-{month:02d}") + f"\nПлан: {plan} | Факт: {total} | Вып: {k}"
+    hdr = bold(f"📈 Продажи {human_network_or_user(target)} за {year:04d}-{month:02d}") + \
+          f"\nПлан: {plan} | Факт: {total} | Вып: {k}"
     lines = [hdr]
-
     if by_model:
         for m, s in sorted(by_model.items(), key=lambda x: (-x[1], x[0])):
             lines.append(f"• {m} — {s}")
     await message.reply("\n".join(lines))
 
-
-@router.message(Command("set_sales"))
+@router.message(Command("set_sales")))
 async def cmd_set_sales(message: Message):
     if not await admin_guard(message):
         return
+    # /set_sales <@user|user_id|network> <model> <memory> <qty> [network]
     parts = (message.text or "").split()
-    u = extract_mentioned_username(message.text)
-    if not u:
-        await message.reply("Формат: /set_sales @user model memory qty [network]")
+    args = parts[1:]
+    if len(args) < 3:
+        await message.reply("Формат: /set_sales @user|user_id|network model memory qty [network]")
         return
+
+    subj = args[0]
     try:
-        rest = [p for p in parts if not p.startswith("/") and not p.startswith("@")]
-        if len(rest) < 3:
-            await message.reply("Формат: /set_sales @user model memory qty [network]")
-            return
+        u = resolve_subject_to_username(subj)
+    except ValueError as e:
+        await message.reply(f"⚠️ {e}")
+        return
+
+    rest = args[1:]
+    if len(rest) < 3:
+        await message.reply("Формат: /set_sales @user|user_id|network model memory qty [network]")
+        return
+
+    try:
         model = re.sub(r"\s+", "", rest[0]).lower()
         memory = str(int(rest[1]))
         qty = int(rest[2])
@@ -377,29 +432,27 @@ async def cmd_set_sales(message: Message):
     except Exception as e:
         await message.reply(f"⚠️ Ошибка: {e}")
 
-
-@router.message(Command("set_plan"))
+@router.message(Command("set_plan")))
 async def cmd_set_plan(message: Message):
     if not await admin_guard(message):
         return
+    # /set_plan <@user|user_id|network|all> <PLAN> [YYYY-MM]
     parts = (message.text or "").split()
     if len(parts) < 3:
-        await message.reply("Формат: /set_plan @user|all PLAN [YYYY-MM]")
+        await message.reply("Формат: /set_plan @user|user_id|network|all PLAN [YYYY-MM]")
         return
 
-    tgt_user = extract_mentioned_username(message.text)
-    target_all = (parts[1].lower() == "all")
+    subj = parts[1]
+    target_all = (subj.lower() == "all")
 
     nums = [p for p in parts if re.fullmatch(r"\d+", p)]
-    ym = [p for p in parts if re.fullmatch(r"\d{4}-\d{2}", p) or re.fullmatch(r"\d{6}", p)]
-
+    ym_tokens = [p for p in parts if token_is_month(p)]
     if not nums:
         await message.reply("Укажи план, например 120.")
         return
-
     plan_val = int(nums[0])
-    month_s = ym[0] if ym else None
-    y, m = parse_yyyymm(month_s)
+    ym_s = ym_tokens[0] if ym_tokens else None
+    y, m = parse_yyyymm(ym_s)
     ym_key = f"{y:04d}-{m:02d}"
 
     if target_all:
@@ -409,36 +462,123 @@ async def cmd_set_plan(message: Message):
         await message.reply(f"✅ План {plan_val} проставлен всем на {ym_key}.")
         return
 
-    if not tgt_user:
-        await message.reply("Укажи @user или all. Пример: /set_plan @vasya 120 2025-08")
+    try:
+        tgt_user = resolve_subject_to_username(subj)
+    except ValueError as e:
+        await message.reply(f"⚠️ {e}")
         return
 
     db.set_plan(tgt_user, ym_key, plan_val)
     await message.reply(f"✅ План {human_network_or_user(tgt_user)}: {plan_val} на {ym_key}")
 
-
-@router.message(Command("plan_show"))
+@router.message(Command("plan_show")))
 async def cmd_plan_show(message: Message):
+    # /plan_show [YYYY-MM]
     parts = (message.text or "").split()
     ym = None
     for p in parts[1:]:
-        if re.fullmatch(r"\d{4}-\d{2}", p) or re.fullmatch(r"\d{6}", p):
+        if token_is_month(p):
             ym = p
             break
     y, m = parse_yyyymm(ym)
     ym_key = f"{y:04d}-{m:02d}"
-
     plans = db.get_all_plans(ym_key)
     if not plans:
         await message.reply(f"Планы на {ym_key} не заданы.")
         return
-
     lines = [bold(f"📋 Планы на {ym_key}")]
     for u, p in sorted(plans.items()):
         total, _ = db.month_sales(y, m, username=u)
         lines.append(f"{human_network_or_user(u)}: план {p} | факт {total} | {pct(total, p)}")
     await message.reply("\n".join(lines))
 
+@router.message(Command("set_fact")))
+async def cmd_set_fact(message: Message):
+    """
+    /set_fact <@user|user_id|network> <QTY> [YYYY-MM]
+    Жёстко перезаписывает факт за месяц (удаляет все продажи за месяц и ставит одну 'manual').
+    """
+    if not await admin_guard(message):
+        return
+
+    parts = (message.text or "").split()
+    args = parts[1:]
+    if len(args) < 2:
+        await message.reply("Формат: /set_fact @user|user_id|network QTY [YYYY-MM]")
+        return
+
+    subj = args[0]
+    qty_token = None
+    ym_token = None
+    for t in args[1:]:
+        if qty_token is None and re.fullmatch(r"\d+", t):
+            qty_token = t
+        elif ym_token is None and token_is_month(t):
+            ym_token = t
+
+    if qty_token is None:
+        await message.reply("Укажи количество, например 25.")
+        return
+
+    try:
+        u = resolve_subject_to_username(subj)
+    except ValueError as e:
+        await message.reply(f"⚠️ {e}")
+        return
+
+    y, m = parse_yyyymm(ym_token)
+    ym_key = f"{y:04d}-{m:02d}"
+    net = db.get_network(u) or "-"
+
+    try:
+        db.set_monthly_fact(u, ym_key, int(qty_token), net)
+        await message.reply(f"✅ Факт для {human_network_or_user(u)} установлен: {qty_token} за {ym_key}.")
+    except Exception as e:
+        await message.reply(f"⚠️ Ошибка: {e}")
+
+@router.message(Command("add_fact")))
+async def cmd_add_fact(message: Message):
+    """
+    /add_fact <@user|user_id|network> <QTY> [YYYY-MM]
+    Добавляет к факту за месяц (вставляет ещё одну 'manual' запись).
+    """
+    if not await admin_guard(message):
+        return
+
+    parts = (message.text or "").split()
+    args = parts[1:]
+    if len(args) < 2:
+        await message.reply("Формат: /add_fact @user|user_id|network QTY [YYYY-MM]")
+        return
+
+    subj = args[0]
+    qty_token = None
+    ym_token = None
+    for t in args[1:]:
+        if qty_token is None and re.fullmatch(r"\d+", t):
+            qty_token = t
+        elif ym_token is None and token_is_month(t):
+            ym_token = t
+
+    if qty_token is None:
+        await message.reply("Укажи количество, например 5.")
+        return
+
+    try:
+        u = resolve_subject_to_username(subj)
+    except ValueError as e:
+        await message.reply(f"⚠️ {e}")
+        return
+
+    y, m = parse_yyyymm(ym_token)
+    ym_key = f"{y:04d}-{m:02d}"
+    net = db.get_network(u) or "-"
+
+    try:
+        db.add_monthly_fact(u, ym_key, int(qty_token), net)
+        await message.reply(f"➕ Добавлено к факту {human_network_or_user(u)}: +{qty_token} за {ym_key}.")
+    except Exception as e:
+        await message.reply(f"⚠️ Ошибка: {e}")
 
 # ============================
 # --- Отчёты и напоминания ---
@@ -464,7 +604,6 @@ async def daily_report():
         lines.append(f"{human_network_or_user(u)}: факт {fact} / план {plan} ({pr}), проекция {proj}")
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
-
 async def weekly_projection():
     d = now_ala()
     y, m = d.year, d.month
@@ -485,7 +624,6 @@ async def weekly_projection():
         lines.append(f"{human_network_or_user(u)}: факт {fact}, план {plan}, проекция {proj}")
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
-
 async def weekly_stock_reminder():
     users = db.get_all_known_users()
     if not users:
@@ -494,7 +632,6 @@ async def weekly_stock_reminder():
     txt = bold("📦 Напоминание о стоках") + "\n" + \
           "Обновите остатки (модель память — количество). " + mentions
     await bot.send_message(GROUP_CHAT_ID, txt)
-
 
 async def monthly_report():
     d = now_ala()
@@ -516,7 +653,6 @@ async def monthly_report():
     lines.append(bold(f"ИТОГО: {total_all} / {plan_all} ({pct(total_all, plan_all)})"))
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
-
 async def inactive_promoters_reminder():
     cutoff = now_ala() - timedelta(days=2)
     users = db.get_all_known_users()
@@ -530,7 +666,6 @@ async def inactive_promoters_reminder():
     txt = bold("🔔 Напоминание") + "\n" + \
           "Нет продаж за последние 48 часов: " + ", ".join(human_network_or_user(u) for u in lazy)
     await bot.send_message(GROUP_CHAT_ID, txt)
-
 
 # =========
 #   MAIN
@@ -547,6 +682,7 @@ async def main():
     scheduler.add_job(weekly_stock_reminder, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(inactive_promoters_reminder, "cron", hour=20, minute=30, timezone="Asia/Almaty")
+    # Автосброс продаж в начале месяца (как обсуждали)
     scheduler.add_job(db.reset_monthly_sales, "cron", day=1, hour=0, minute=5, timezone="Asia/Almaty")
     scheduler.start()
 
@@ -563,7 +699,6 @@ async def main():
     print(f"🚀 Webhook бот запущен на {WEBHOOK_URL}")
     while True:
         await asyncio.sleep(3600)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
