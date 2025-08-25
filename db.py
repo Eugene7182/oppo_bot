@@ -1,7 +1,8 @@
 import sqlite3
 from datetime import datetime
 
-conn = sqlite3.connect("sales.db")
+# Используем один файл БД
+conn = sqlite3.connect("sales.db", check_same_thread=False)
 cursor = conn.cursor()
 
 # --- Таблицы ---
@@ -46,7 +47,7 @@ CREATE TABLE IF NOT EXISTS admins (
 conn.commit()
 
 # --- Продажи ---
-def add_sale(username, model, memory, qty, network="-"):
+def add_sale(username, model, memory, qty, network):
     cursor.execute(
         "INSERT INTO sales (username, model, memory, qty, network, date) VALUES (?, ?, ?, ?, ?, ?)",
         (username, model, memory, qty, network, datetime.now().strftime("%Y-%m-%d"))
@@ -57,49 +58,47 @@ def get_sales_month():
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
     cursor.execute("""
         SELECT username, SUM(qty),
-        (SELECT plan FROM plans WHERE plans.username = sales.username),
-        COALESCE(network, '-')
+               (SELECT plan FROM plans WHERE plans.username = sales.username),
+               network
         FROM sales
-        WHERE date>=?
+        WHERE date >= ?
         GROUP BY username, network
     """, (month_start,))
     return cursor.fetchall()
 
-def get_sales_all(date):
+def get_sales_all(date_str):
     cursor.execute("""
         SELECT username, SUM(qty),
-        (SELECT plan FROM plans WHERE plans.username = sales.username),
-        COALESCE(network, '-')
+               (SELECT plan FROM plans WHERE plans.username = sales.username),
+               network
         FROM sales
-        WHERE date=?
+        WHERE date = ?
         GROUP BY username, network
-    """, (date,))
+    """, (date_str,))
     return cursor.fetchall()
+
+def reset_monthly_sales():
+    month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
+    cursor.execute("DELETE FROM sales WHERE date >= ?", (month_start,))
+    conn.commit()
 
 def get_sales_by_network(network):
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
     cursor.execute("""
         SELECT username, SUM(qty),
-        (SELECT plan FROM plans WHERE plans.username = sales.username)
+               (SELECT plan FROM plans WHERE plans.username = sales.username)
         FROM sales
-        WHERE date>=? AND network=?
+        WHERE date >= ? AND network = ?
         GROUP BY username
     """, (month_start, network))
     return cursor.fetchall()
 
-def reset_monthly_sales():
-    month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
-    cursor.execute("DELETE FROM sales WHERE date>=?", (month_start,))
-    conn.commit()
-
-# --- Планы ---
-def set_plan(username, plan):
-    cursor.execute("INSERT OR REPLACE INTO plans (username, plan) VALUES (?, ?)", (username, plan))
-    conn.commit()
-
 # --- Стоки ---
-def update_stock(username, item, qty, network="-"):
-    cursor.execute("SELECT qty FROM stok WHERE username=? AND item=? AND network=?", (username, item, network))
+def update_stock(username, item, qty, network):
+    cursor.execute(
+        "SELECT qty FROM stok WHERE username=? AND item=? AND network=?",
+        (username, item, network)
+    )
     row = cursor.fetchone()
     if row:
         cursor.execute(
@@ -113,35 +112,67 @@ def update_stock(username, item, qty, network="-"):
         )
     conn.commit()
 
-def get_stocks(username=None, network=None):
-    query = "SELECT username, item, qty, network, last_update FROM stok WHERE 1=1"
-    params = []
-    if username:
-        query += " AND username=?"
-        params.append(username)
-    if network:
-        query += " AND network=?"
-        params.append(network)
-    cursor.execute(query, tuple(params))
-    return cursor.fetchall()
-
-def get_stock_qty(username, item, network="-"):
-    cursor.execute("SELECT qty FROM stok WHERE username=? AND item=? AND network=?", (username, item, network))
+def get_stock_qty(username, item, network):
+    cursor.execute(
+        "SELECT qty FROM stok WHERE username=? AND item=? AND network=?",
+        (username, item, network)
+    )
     row = cursor.fetchone()
     return row[0] if row else None
 
-def decrease_stock(username, item, qty, network="-"):
-    cursor.execute("SELECT qty FROM stok WHERE username=? AND item=? AND network=?", (username, item, network))
+def decrease_stock(username, item, qty, network):
+    cursor.execute(
+        "SELECT qty FROM stok WHERE username=? AND item=? AND network=?",
+        (username, item, network)
+    )
     row = cursor.fetchone()
-    if row:
-        new_qty = max(0, row[0] - qty)
-        cursor.execute(
-            "UPDATE stok SET qty=?, last_update=? WHERE username=? AND item=? AND network=?",
-            (new_qty, datetime.now().strftime("%Y-%m-%d %H:%M"), username, item, network)
-        )
-        conn.commit()
+    if not row:
+        return
+    new_qty = max(0, row[0] - qty)
+    cursor.execute(
+        "UPDATE stok SET qty=?, last_update=? WHERE username=? AND item=? AND network=?",
+        (new_qty, datetime.now().strftime("%Y-%m-%d %H:%M"), username, item, network)
+    )
+    conn.commit()
 
-# --- Админы ---
+def get_stocks():
+    cursor.execute("SELECT username, item, qty, network, last_update FROM stok")
+    return cursor.fetchall()
+
+# --- Поиск похожей позиции стока по модели+памяти ---
+def find_stock_like(username, model, memory, network):
+    """
+    Ищем "приближённое" совпадение:
+    - сравниваем без пробелов и в нижнем регистре
+    - проверяем, что в item встречается модель и цифры памяти
+    """
+    cursor.execute(
+        "SELECT item, qty FROM stok WHERE username=? AND network=?",
+        (username, network)
+    )
+    rows = cursor.fetchall()
+
+    model_low = (model or "").lower().replace(" ", "")
+    memory_low = str(memory).lower().replace(" ", "")
+
+    for item, qty in rows:
+        item_low = (item or "").lower().replace(" ", "")
+        if model_low and model_low in item_low and memory_low in item_low:
+            return item, qty
+    return None, None
+
+# --- Планы и админы ---
+def set_plan(username, plan):
+    cursor.execute(
+        "INSERT OR REPLACE INTO plans (username, plan) VALUES (?, ?)",
+        (username, plan)
+    )
+    conn.commit()
+
+def is_admin(username):
+    cursor.execute("SELECT 1 FROM admins WHERE username=?", (username,))
+    return cursor.fetchone() is not None
+
 def add_admin(username):
     cursor.execute("INSERT OR IGNORE INTO admins (username) VALUES (?)", (username,))
     conn.commit()
@@ -154,6 +185,3 @@ def get_admins():
     cursor.execute("SELECT username FROM admins")
     return [row[0] for row in cursor.fetchall()]
 
-def is_admin(username):
-    cursor.execute("SELECT 1 FROM admins WHERE username=?", (username,))
-    return cursor.fetchone() is not None
