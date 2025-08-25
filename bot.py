@@ -56,7 +56,6 @@ def parse_yyyymm(s: str | None) -> tuple[int, int]:
     if re.fullmatch(r"\d{4}-\d{2}", s):
         year, month = s.split("-")
         return int(year), int(month)
-    # если прилетело 202508 — тоже поддержим
     if re.fullmatch(r"\d{6}", s):
         return int(s[:4]), int(s[4:])
     raise ValueError("Неверный формат месяца. Жду YYYY-MM, например 2025-08.")
@@ -86,7 +85,6 @@ def human_network(net: str) -> str:
 # Обёртки для совместимости
 # -------------------------
 def list_admins_safe():
-    """Поддержка и db.list_admins(), и db.get_admins()."""
     if hasattr(db, "list_admins"):
         try:
             return db.list_admins()
@@ -100,7 +98,6 @@ def list_admins_safe():
     return []
 
 def get_last_sale_dt(username: str):
-    """Поддержка и db.get_last_sale_time(), и db.get_last_sale()."""
     if hasattr(db, "get_last_sale_time"):
         try:
             return db.get_last_sale_time(username)
@@ -111,8 +108,7 @@ def get_last_sale_dt(username: str):
             s = db.get_last_sale(username)
             if not s:
                 return None
-            # ожидаем YYYY-MM-DD
-            return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=tz)
+            return tz.localize(datetime.strptime(s, "%Y-%m-%d"))
         except Exception:
             return None
     return None
@@ -149,14 +145,13 @@ async def admin_guard(message: Message) -> bool:
 # ============================
 # --- Регулярки парсинга ---
 # ============================
-# Пример: "Reno 11F 5G 128 - 2", "11 128 1", "reno 12 256", "11f 5g 128-3"
+# Примеры: "Reno 11F 5G 128 - 2", "11 128 1", "reno 12 256", "11f 5g 128-3"
 SALE_RE = re.compile(
     r"((?:reno\s*)?\d{1,2}\s*(?:f)?\s*(?:5\s*g)?)\s*(\d{1,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
     re.IGNORECASE
 )
 
-# Для обновления стоков строками
-# "Reno 11F 5G 128 - 3"
+# Для обновления стоков строками: "Reno 11F 5G 128 - 3"
 STOCK_RE = re.compile(
     r"([a-zа-яё0-9\+\-\s]+?)\s*(?:\(?\d+\s*/\s*\)?)?\s*(\d{1,4})(?:тб|tb)?\s*[-—: ]?\s*(\d+)?",
     re.IGNORECASE
@@ -326,7 +321,7 @@ async def cmd_stocks(message: Message):
         lines.append(f"{item} — {qty}")
     await message.reply("\n".join(lines))
 
-@router.message(Command("sales_month")))
+@router.message(Command("sales_month"))
 async def cmd_sales_month(message: Message):
     # /sales_month [YYYY-MM] [@user]
     txt = (message.text or "").strip()
@@ -542,13 +537,15 @@ async def main():
     scheduler.add_job(weekly_stock_reminder, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(inactive_promoters_reminder, "cron", hour=20, minute=30, timezone="Asia/Almaty")
+    # 👉 Автосброс продаж в начале месяца
+    scheduler.add_job(db.reset_monthly_sales, "cron", day=1, hour=0, minute=5, timezone="Asia/Almaty")
     scheduler.start()
 
     # AIOHTTP
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
 
-    # health-check рут (только GET — без HEAD, чтобы не падало на дубль)
+    # health-check рут
     async def health(request):
         return web.Response(text="OK")
     app.add_routes([web.get("/", health)])
