@@ -78,6 +78,18 @@ def extract_mentioned_username(text: str) -> str | None:
     m = re.search(r"@([A-Za-z0-9_]+)", text or "")
     return m.group(1) if m else None
 
+# NEW: поддержка @username ИЛИ числового ID
+def extract_user_ref(text: str) -> str | None:
+    if not text:
+        return None
+    m = re.search(r"@([A-Za-z0-9_]+)", text)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\b\d{6,12}\b", text)  # телеграм id обычно 7-10 цифр
+    if m2:
+        return m2.group(0)
+    return None
+
 def human_network(net: str) -> str:
     return net if net and net != "-" else "—"
 
@@ -240,7 +252,7 @@ async def cmd_help(message: Message):
         "/help — это меню",
         "/stocks [@user] [network] — показать стоки (по умолчанию твои)",
         "/sales_month [YYYY-MM] [@user] — продажи за месяц",
-        "/set_network @user network или '-' — привязать сеть пользователю",
+        "/set_network @user network или '-' — привязать сеть пользователю (можно ID вместо @user)",
         "/set_sales @user model memory qty [network] — добавить продажу",
         "/set_plan @user|all PLAN [YYYY-MM] — задать план",
         "/plan_show [YYYY-MM] — показать планы",
@@ -285,16 +297,21 @@ async def cmd_set_network(message: Message):
     if not await admin_guard(message):
         return
     parts = message.text.split()
-    u = extract_mentioned_username(message.text)
-    if not u or len(parts) < 3:
-        await message.reply("Формат: /set_network @user network или '-'")
+    # ПРИНИМАЕМ @username ИЛИ ID
+    target = extract_user_ref(message.text)
+    if not target or len(parts) < 3:
+        await message.reply("Формат: /set_network @user network   или   /set_network user_id network   или   /set_network @user -")
         return
     network = parts[-1]
-    if network == "@"+u:  # если слиплось
-        await message.reply("Формат: /set_network @user network или '-'")
+    if network == "@"+str(target):  # если слиплось
+        await message.reply("Формат: /set_network @user network   или   /set_network user_id network   или   /set_network @user -")
         return
-    db.set_network(u, "-" if network == "-" else network)
-    await message.reply(f"🔗 @{u} → сеть: {human_network(network)}")
+    if network == "-":
+        db.set_network(target, "-")
+        await message.reply(f"❌ Сеть для {target} удалена")
+        return
+    db.set_network(target, network)
+    await message.reply(f"🔗 {target} → сеть: {human_network(network)}")
 
 @router.message(Command("stocks"))
 async def cmd_stocks(message: Message):
@@ -321,7 +338,7 @@ async def cmd_stocks(message: Message):
         lines.append(f"{item} — {qty}")
     await message.reply("\n".join(lines))
 
-@router.message(Command("sales_month"))
+@router.message(Command("sales_month")))
 async def cmd_sales_month(message: Message):
     # /sales_month [YYYY-MM] [@user]
     txt = (message.text or "").strip()
@@ -340,7 +357,10 @@ async def cmd_sales_month(message: Message):
     total, by_model = db.month_sales(year, month, username=target)
     plan = db.get_plan(target, f"{year:04d}-{month:02d}") or 0
     k = pct(total, plan) if plan else "—"
-    hdr = bold(f"📈 Продажи @{target} за {year:04d}-{month:02d}") + f"\nПлан: {plan} | Факт: {total} | Вып: {k}"
+    # В отчёте показываем сеть, если задана
+    name_for_report = db.get_network(target)
+    display_name = name_for_report if name_for_report and name_for_report != "-" else f"@{target}"
+    hdr = bold(f"📈 Продажи {display_name} за {year:04d}-{month:02d}") + f"\nПлан: {plan} | Факт: {total} | Вып: {k}"
     lines = [hdr]
     if by_model:
         for m, s in sorted(by_model.items(), key=lambda x: (-x[1], x[0])):
@@ -426,7 +446,10 @@ async def cmd_plan_show(message: Message):
     lines = [bold(f"📋 Планы на {ym_key}")]
     for u, p in sorted(plans.items()):
         total, _ = db.month_sales(y, m, username=u)
-        lines.append(f"@{u}: план {p} | факт {total} | {pct(total, p)}")
+        # Отображаем сеть, если есть
+        display_user = db.get_network(u)
+        display = display_user if display_user and display_user != "-" else f"@{u}"
+        lines.append(f"{display}: план {p} | факт {total} | {pct(total, p)}")
     await message.reply("\n".join(lines))
 
 # ============================
@@ -451,7 +474,10 @@ async def daily_report():
         # проекция
         pace = (fact / day) if day > 0 else 0
         proj = round(pace * days_in_month)
-        lines.append(f"@{u}: факт {fact} / план {plan} ({pr}), проекция {proj}")
+        # Показываем сеть вместо ID/ника, если есть
+        display = db.get_network(u)
+        display_name = display if display and display != "-" else f"@{u}"
+        lines.append(f"{display_name}: факт {fact} / план {plan} ({pr}), проекция {proj}")
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
 async def weekly_projection():
@@ -471,7 +497,9 @@ async def weekly_projection():
         plan = db.get_plan(u, ym_key) or 0
         pace = (fact / day) if day > 0 else 0
         proj = round(pace * days_in_month)
-        lines.append(f"@{u}: факт {fact}, план {plan}, проекция {proj}")
+        display = db.get_network(u)
+        display_name = display if display and display != "-" else f"@{u}"
+        lines.append(f"{display_name}: факт {fact}, план {plan}, проекция {proj}")
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
 async def weekly_stock_reminder():
@@ -500,7 +528,9 @@ async def monthly_report():
         plan = db.get_plan(u, ym_key) or 0
         total_all += fact
         plan_all += plan
-        lines.append(f"@{u}: {fact} / {plan} ({pct(fact, plan)})")
+        display = db.get_network(u)
+        display_name = display if display and display != "-" else f"@{u}"
+        lines.append(f"{display_name}: {fact} / {plan} ({pct(fact, plan)})")
     lines.append(bold(f"ИТОГО: {total_all} / {plan_all} ({pct(total_all, plan_all)})"))
     await bot.send_message(GROUP_CHAT_ID, "\n".join(lines))
 
@@ -537,7 +567,7 @@ async def main():
     scheduler.add_job(weekly_stock_reminder, "cron", day_of_week="sun", hour=12, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(monthly_report, "cron", day="last", hour=20, minute=0, timezone="Asia/Almaty")
     scheduler.add_job(inactive_promoters_reminder, "cron", hour=20, minute=30, timezone="Asia/Almaty")
-    # 👉 Автосброс продаж в начале месяца
+    # Автосброс продаж в начале месяца (как у тебя было)
     scheduler.add_job(db.reset_monthly_sales, "cron", day=1, hour=0, minute=5, timezone="Asia/Almaty")
     scheduler.start()
 
