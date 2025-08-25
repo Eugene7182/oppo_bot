@@ -1,4 +1,7 @@
 aiogram==3.*
-apscheduler==3.10.4
 aiohttp==3.*
-pytz==2025.*
+apscheduler==3.10.*
+pytz
+rapidfuzz==3.*
+SQLAlchemy==2.*
+python-dateutil
