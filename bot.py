@@ -698,12 +698,13 @@ async def on_startup(app: web.Application):
         log.warning("RENDER_EXTERNAL_URL пуст — вебхук не поставлен")
 
     # Планировщик
-    # Планировщик
     if DATABASE_URL and HAS_SQLA:
-    scheduler = AsyncIOScheduler(timezone=str(TZ),
-                                 jobstores={"default": SQLAlchemyJobStore(url=DATABASE_URL)})
+        scheduler = AsyncIOScheduler(
+            timezone=str(TZ),
+            jobstores={"default": SQLAlchemyJobStore(url=DATABASE_URL)}
+        )
     else:
-    scheduler = AsyncIOScheduler(timezone=str(TZ))
+        scheduler = AsyncIOScheduler(timezone=str(TZ))
 
     # Свод в 20:00
     scheduler.add_job(lambda: daily_summary_and_projection(app["repo"]), "cron",
@@ -740,5 +741,6 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN environment variable")
     web.run_app(build_app(), port=PORT)
+
 
 
